@@ -147,6 +147,27 @@ class UnrewindableBodyError(RequestException):
     """Requests encountered an error when trying to rewind a body."""
 
 
+class CookieBranchConflictError(RequestException):
+    """A cookie branch could not be committed because the session's cookie
+    jar changed independently for at least one of the same cookies.
+
+    The conflicting ``(domain, path, name)`` keys are available on the
+    :attr:`conflicts` attribute. No part of the branch was merged.
+    """
+
+    conflicts: tuple[tuple[str, str, str], ...]
+
+    def __init__(self, conflicts: Any = (), *args: Any, **kwargs: Any) -> None:
+        self.conflicts = tuple(conflicts)
+        if not args:
+            names = ", ".join(
+                f"{name} (domain={domain!r}, path={path!r})"
+                for domain, path, name in self.conflicts
+            )
+            args = (f"Cookie branch conflicts with session changes on: {names}",)
+        super().__init__(*args, **kwargs)
+
+
 # Warnings
 
 

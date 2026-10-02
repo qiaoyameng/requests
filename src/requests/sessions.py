@@ -8,6 +8,7 @@ requests (cookies, auth, proxies).
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import time
@@ -29,6 +30,7 @@ from .cookies import (
 )
 from .exceptions import (
     ChunkedEncodingError,
+    CookieBranchConflictError,
     ContentDecodingError,
     InvalidSchema,
     TooManyRedirects,
@@ -59,7 +61,7 @@ from .utils import (  # noqa: F401
 )
 
 if TYPE_CHECKING:
-    from http.cookiejar import CookieJar
+    from http.cookiejar import Cookie, CookieJar
 
     from typing_extensions import Self, Unpack
 
@@ -122,6 +124,40 @@ def merge_hooks(
         return session_hooks
 
     return merge_setting(request_hooks, session_hooks, dict_class)
+
+
+# Cookies are identified by the (domain, path, name) triple, matching the
+# way http.cookiejar keys its internal storage.
+_CookieKey = tuple[str, str, str]  # (domain, path, name)
+
+
+def _live_cookies(jar: CookieJar) -> dict[_CookieKey, Cookie]:
+    """Map a jar's live (unexpired) cookies by (domain, path, name)."""
+    return {
+        (cookie.domain, cookie.path, cookie.name): cookie
+        for cookie in jar
+        if not cookie.is_expired()
+    }
+
+
+def _cookie_fingerprint(cookie: Cookie | None) -> tuple[str | None, int | None] | None:
+    """A comparable identity for divergence checks; None means absent."""
+    if cookie is None:
+        return None
+    return (cookie.value, cookie.expires)
+
+
+def _clone_cookie_jar(jar: CookieJar) -> CookieJar:
+    """Return a copy of *jar* that shares no Cookie instances with it."""
+    if isinstance(jar, RequestsCookieJar):
+        new_jar: CookieJar = RequestsCookieJar()
+        new_jar.set_policy(jar.get_policy())
+    else:
+        new_jar = copy.copy(jar)
+        new_jar.clear()
+    for cookie in jar:
+        new_jar.set_cookie(copy.copy(cookie))
+    return new_jar
 
 
 class SessionRedirectMixin:
@@ -885,6 +921,26 @@ class Session(SessionRedirectMixin):
         for v in self.adapters.values():
             v.close()
 
+    def cookie_branch(self) -> CookieBranch:
+        """Create an explicitly-committed cookie branch for this session.
+
+        Returns a context manager that snapshots the session's cookies by
+        ``(domain, path, name)`` on entry and lets a group of requests --
+        for example a chain of interdependent redirects -- accumulate
+        cookies in isolation. Changes are only kept if :meth:`CookieBranch.commit`
+        is called; leaving the block without committing, or raising through
+        it, discards them. The session's connection adapters are shared with
+        the branch and are never closed by it.
+
+        Usage::
+
+            with s.cookie_branch() as branch:
+                s.get("https://example.com/login")
+                s.get("https://example.com/finalize")
+                branch.commit()
+        """
+        return CookieBranch(self)
+
     def mount(self, prefix: str, adapter: BaseAdapter) -> None:
         """Registers a connection adapter to a prefix.
 
@@ -903,6 +959,112 @@ class Session(SessionRedirectMixin):
     def __setstate__(self, state: dict[str, Any]) -> None:
         for attr, value in state.items():
             setattr(self, attr, value)
+
+
+class CookieBranch:
+    """A manually-committed cookie branch bound to a :class:`Session`.
+
+    On entry, the session's cookies are snapshotted by ``(domain, path,
+    name)`` and the session starts accumulating cookies -- including any
+    set by redirects -- into a private branch jar. Leaving the context
+    manager never commits: uncommitted or exceptional exits simply discard
+    the branch's changes. Closing the branch only restores the session's
+    original cookie jar; it never closes the session's connection adapters.
+
+    Calling :meth:`commit` merges the branch's additions, modifications and
+    deletions (including cookies deleted through expiry) back into the
+    session's jar. If the session's jar has independently diverged from the
+    baseline for any cookie the branch also changed, a
+    :class:`CookieBranchConflictError <requests.exceptions.CookieBranchConflictError>`
+    is raised and no part of the merge is applied. Independent changes to
+    other cookies are preserved.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        self._parent_jar: CookieJar | None = None
+        self._branch_jar: CookieJar | None = None
+        self._baseline: dict[_CookieKey, tuple[str | None, int | None] | None] = {}
+        self._active = False
+
+    def __enter__(self) -> Self:
+        if self._active:
+            raise RuntimeError("cookie branch is already active")
+        parent_jar = self._session.cookies
+        self._parent_jar = parent_jar
+        self._baseline = {
+            key: _cookie_fingerprint(cookie)
+            for key, cookie in _live_cookies(parent_jar).items()
+        }
+        self._branch_jar = _clone_cookie_jar(parent_jar)
+        self._session.cookies = cast("RequestsCookieJar", self._branch_jar)
+        self._active = True
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+    @property
+    def cookies(self) -> CookieJar:
+        """The branch's private working cookie jar."""
+        if self._branch_jar is None or not self._active:
+            raise RuntimeError("cookie branch is not active")
+        return self._branch_jar
+
+    def commit(self) -> None:
+        """Merge the branch's cookie changes into the session's cookie jar.
+
+        Additions, modifications and deletions made inside the branch are
+        applied atomically. If the session's jar diverged from the baseline
+        for any cookie the branch also changed,
+        :class:`CookieBranchConflictError <requests.exceptions.CookieBranchConflictError>`
+        is raised and nothing is merged.
+        """
+        if not self._active or self._parent_jar is None or self._branch_jar is None:
+            raise RuntimeError("cannot commit an inactive cookie branch")
+
+        parent_state = _live_cookies(self._parent_jar)
+        branch_state = _live_cookies(self._branch_jar)
+
+        changed_keys = {
+            key
+            for key in set(self._baseline) | set(branch_state)
+            if _cookie_fingerprint(branch_state.get(key)) != self._baseline.get(key)
+        }
+        conflicts = sorted(
+            key
+            for key in changed_keys
+            if _cookie_fingerprint(parent_state.get(key)) != self._baseline.get(key)
+        )
+        if conflicts:
+            raise CookieBranchConflictError(conflicts)
+
+        # Every changed key still matches the baseline in the parent jar,
+        # so the merge applies cleanly as a single, all-or-nothing step.
+        for key in changed_keys:
+            domain, path, name = key
+            cookie = branch_state.get(key)
+            if cookie is None:
+                try:
+                    self._parent_jar.clear(domain, path, name)
+                except KeyError:
+                    pass
+            else:
+                self._parent_jar.set_cookie(copy.copy(cookie))
+
+        self.close()
+
+    def close(self) -> None:
+        """End the branch, discarding any uncommitted changes.
+
+        Only the cookie jar is detached from the session; the session's
+        connection adapters are left untouched.
+        """
+        if not self._active:
+            return
+        if self._parent_jar is not None:
+            self._session.cookies = cast("RequestsCookieJar", self._parent_jar)
+        self._active = False
 
 
 def session() -> Session:
