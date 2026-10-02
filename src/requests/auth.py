@@ -14,6 +14,7 @@ import threading
 import time
 import warnings
 from base64 import b64encode
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Final, cast, overload
 
 from ._internal_utils import to_native_string
@@ -29,6 +30,78 @@ if TYPE_CHECKING:
 
 CONTENT_TYPE_FORM_URLENCODED: Final = "application/x-www-form-urlencoded"
 CONTENT_TYPE_MULTI_PART: Final = "multipart/form-data"
+
+_DEFAULT_PORTS: Final = {"http": 80, "https": 443}
+
+#: Bound on the number of learned protection spaces cached per thread when
+#: using ``HTTPDigestAuth`` in multi-domain mode.
+_MAX_CACHED_PROTECTION_SPACES: Final = 32
+
+
+def _normalized_origin(url: str) -> tuple[str, str, int | None]:
+    """Return a ``(scheme, host, port)`` origin tuple for ``url``.
+
+    Default ports are filled in so that, e.g., ``http://example.com`` and
+    ``http://example.com:80`` are considered the same origin.
+    """
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme)
+    return scheme, host, port
+
+
+def _domain_covers_path(domain: str, path: str) -> bool:
+    """Return True if ``path`` falls inside the protection-space ``domain``.
+
+    Matching happens on path-segment boundaries so that ``/api`` covers
+    ``/api`` and ``/api/users`` but never ``/apix``.
+    """
+    if domain == "/" or path == domain:
+        return True
+    prefix = domain if domain.endswith("/") else f"{domain}/"
+    return path.startswith(prefix)
+
+
+def _parse_domain_directive(
+    directive: str, origin: tuple[str, str, int | None]
+) -> tuple[str, ...]:
+    """Parse a challenge ``domain`` directive into same-origin abs_paths.
+
+    Absolute URIs naming a different origin are dropped: a domain directive
+    must never authorize sending credentials to an external origin.
+    """
+    paths = []
+    for value in directive.split():
+        if value.startswith("/"):
+            path = value
+        else:
+            parsed = urlparse(value)
+            if not parsed.scheme or not parsed.netloc:
+                continue
+            if _normalized_origin(value) != origin:
+                continue
+            path = parsed.path or "/"
+        if path not in paths:
+            paths.append(path)
+    return tuple(paths)
+
+
+class _DigestProtectionSpace:
+    """Learned digest challenge state for one ``(origin, realm)`` pair."""
+
+    __slots__ = ("chal", "domains", "last_nonce", "nonce_count")
+
+    def __init__(self, chal: dict[str, str], domains: tuple[str, ...]) -> None:
+        self.chal = chal
+        self.domains = domains
+        self.last_nonce = ""
+        self.nonce_count = 0
 
 
 def _basic_auth_str(username: bytes | str, password: bytes | str) -> str:
@@ -122,10 +195,22 @@ class HTTPProxyAuth(HTTPBasicAuth):
 
 
 class HTTPDigestAuth(AuthBase):
-    """Attaches HTTP Digest Authentication to the given Request object."""
+    """Attaches HTTP Digest Authentication to the given Request object.
+
+    :param username: The username to authenticate with.
+    :param password: The password to authenticate with.
+    :param multi_domain: When True, learned challenges are cached per
+        protection space, keyed by origin and realm, and restricted to the
+        URIs named by the challenge's ``domain`` directive. Authorization
+        headers are then only sent preemptively to URIs inside an already
+        learned protection space; anything else waits for its own 401
+        challenge. When False (the default), a single global challenge
+        state is kept, preserving the historical behavior.
+    """
 
     username: bytes | str
     password: bytes | str
+    _multi_domain: bool
     _thread_local: threading.local
     last_nonce: str
     nonce_count: int
@@ -134,13 +219,23 @@ class HTTPDigestAuth(AuthBase):
     num_401_calls: int | None
 
     @overload
-    def __init__(self, username: str, password: str) -> None: ...
+    def __init__(
+        self, username: str, password: str, multi_domain: bool = ...
+    ) -> None: ...
     @overload
-    def __init__(self, username: bytes, password: bytes) -> None: ...
+    def __init__(
+        self, username: bytes, password: bytes, multi_domain: bool = ...
+    ) -> None: ...
 
-    def __init__(self, username: bytes | str, password: bytes | str) -> None:
+    def __init__(
+        self,
+        username: bytes | str,
+        password: bytes | str,
+        multi_domain: bool = False,
+    ) -> None:
         self.username = username
         self.password = password
+        self._multi_domain = multi_domain
         # Keep state in per-thread local storage
         self._thread_local = threading.local()
 
@@ -153,6 +248,70 @@ class HTTPDigestAuth(AuthBase):
             self._thread_local.chal = {}
             self._thread_local.pos = None
             self._thread_local.num_401_calls = None
+            if self._multi_domain:
+                self._thread_local.protection_spaces = OrderedDict()
+
+    def _find_protection_space(self, url: str) -> _DigestProtectionSpace | None:
+        """Return the learned protection space covering ``url``, if any.
+
+        Only spaces matching the request's origin and covering its path via
+        a challenge ``domain`` directive are eligible, so credentials are
+        never preemptively sent outside a learned protection space.
+        """
+        origin = _normalized_origin(url)
+        path = urlparse(url).path or "/"
+        spaces = self._thread_local.protection_spaces
+        best_key = None
+        best_len = -1
+        for key, space in spaces.items():
+            if key[0] != origin:
+                continue
+            for domain in space.domains:
+                if _domain_covers_path(domain, path) and len(domain) > best_len:
+                    best_key = key
+                    best_len = len(domain)
+        if best_key is None:
+            return None
+        spaces.move_to_end(best_key)
+        return spaces[best_key]
+
+    def _learn_protection_space(
+        self, url: str, chal: dict[str, str]
+    ) -> _DigestProtectionSpace:
+        """Record a challenge for the ``(origin, realm)`` it was issued for."""
+        origin = _normalized_origin(url)
+        realm = chal.get("realm") or ""
+        key = (origin, realm)
+        spaces = self._thread_local.protection_spaces
+        directive = chal.get("domain")
+        domains = (
+            _parse_domain_directive(directive, origin) if directive else ()
+        ) or ("/",)
+        space = spaces.get(key)
+        if space is None:
+            space = _DigestProtectionSpace(chal, domains)
+            spaces[key] = space
+            while len(spaces) > _MAX_CACHED_PROTECTION_SPACES:
+                spaces.popitem(last=False)
+        else:
+            space.chal = chal
+            space.domains = domains
+            if (chal.get("stale") or "").lower() == "true":
+                # The server rejected this space's nonce; restart its
+                # nonce count without touching any other protection space.
+                space.last_nonce = ""
+                space.nonce_count = 0
+            spaces.move_to_end(key)
+        return space
+
+    def _activate_protection_space(self, space: _DigestProtectionSpace) -> None:
+        self._thread_local.chal = space.chal
+        self._thread_local.last_nonce = space.last_nonce
+        self._thread_local.nonce_count = space.nonce_count
+
+    def _sync_protection_space(self, space: _DigestProtectionSpace) -> None:
+        space.last_nonce = self._thread_local.last_nonce
+        space.nonce_count = self._thread_local.nonce_count
 
     def build_digest_header(self, method: str, url: str) -> str | None:
         """
@@ -293,7 +452,15 @@ class HTTPDigestAuth(AuthBase):
         if "digest" in s_auth.lower() and self._thread_local.num_401_calls < 2:
             self._thread_local.num_401_calls += 1
             pat = re.compile(r"digest ", flags=re.IGNORECASE)
-            self._thread_local.chal = parse_dict_header(pat.sub("", s_auth, count=1))
+            parsed_chal = parse_dict_header(pat.sub("", s_auth, count=1))
+            space = None
+            if self._multi_domain:
+                space = self._learn_protection_space(
+                    cast(str, r.request.url), parsed_chal
+                )
+                self._activate_protection_space(space)
+            else:
+                self._thread_local.chal = parsed_chal
 
             # Consume content and release the original connection
             # to allow our new request to reuse the same one.
@@ -307,6 +474,8 @@ class HTTPDigestAuth(AuthBase):
             _digest_auth = self.build_digest_header(
                 cast(str, prep.method), cast(str, prep.url)
             )
+            if space is not None:
+                self._sync_protection_space(space)
             if _digest_auth:
                 prep.headers["Authorization"] = _digest_auth
             _r = r.connection.send(prep, **kwargs)
@@ -321,8 +490,20 @@ class HTTPDigestAuth(AuthBase):
     def __call__(self, r: PreparedRequest) -> PreparedRequest:
         # Initialize per-thread state, if needed
         self.init_per_thread_state()
-        # If we have a saved nonce, skip the 401
-        if self._thread_local.last_nonce:
+        if self._multi_domain:
+            # Only preempt challenges for URIs inside a protection space
+            # we have already learned; everything else waits for its 401.
+            space = self._find_protection_space(cast(str, r.url))
+            if space is not None:
+                self._activate_protection_space(space)
+                _digest_auth = self.build_digest_header(
+                    cast(str, r.method), cast(str, r.url)
+                )
+                self._sync_protection_space(space)
+                if _digest_auth:
+                    r.headers["Authorization"] = _digest_auth
+        elif self._thread_local.last_nonce:
+            # If we have a saved nonce, skip the 401
             _digest_auth = self.build_digest_header(
                 cast(str, r.method), cast(str, r.url)
             )

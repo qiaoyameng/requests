@@ -272,6 +272,255 @@ def test_digestauth_only_on_4xx():
         close_server.set()
 
 
+def _digest_challenge(realm, nonce, domain=None):
+    challenge = (
+        f'nonce="{nonce}", realm="{realm}", qop=auth'
+    )
+    if domain is not None:
+        challenge += f', domain="{domain}"'
+    return (
+        b"HTTP/1.1 401 UNAUTHORIZED\r\n"
+        b"Content-Length: 0\r\n"
+        b"Connection: close\r\n"
+        b"WWW-Authenticate: Digest " + challenge.encode("utf-8") + b"\r\n\r\n"
+    )
+
+
+_TEXT_200_CONNECTION_CLOSE = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Length: 0\r\n"
+    b"Connection: close\r\n\r\n"
+)
+
+
+def _authorization_line(request_content):
+    for line in request_content.split(b"\r\n"):
+        if line.lower().startswith(b"authorization:"):
+            return line
+    return None
+
+
+def test_digestauth_multi_domain_isolates_origins():
+    """In multi-domain mode, learned challenges are scoped to the origin and
+    realm that issued them: a second origin must wait for its own challenge,
+    and a ``domain`` directive naming an external origin must not authorize
+    sending credentials there.
+    """
+    nonce_a = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    nonce_b = b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    def make_handler(realm, nonce, seen, challenge_holder):
+        def handler(sock):
+            request_content = consume_socket_content(sock, timeout=0.5)
+            seen.append(request_content)
+            if b"Authorization:" in request_content:
+                sock.send(_TEXT_200_CONNECTION_CLOSE)
+            else:
+                sock.send(challenge_holder["challenge"])
+            return request_content
+
+        return handler
+
+    seen_a, seen_b = [], []
+    challenge_a, challenge_b = {}, {}
+    auth = requests.auth.HTTPDigestAuth("user", "pass", multi_domain=True)
+
+    close_b = threading.Event()
+    server_b = Server(
+        make_handler(b"realm-b", nonce_b, seen_b, challenge_b),
+        requests_to_handle=3,
+        wait_to_close_event=close_b,
+    )
+    with server_b as (host_b, port_b):
+        challenge_b["challenge"] = _digest_challenge("realm-b", nonce_b.decode())
+        # The domain directive for origin A maliciously names origin B; it
+        # must be ignored so credentials are never sent to B because of it.
+        challenge_a["challenge"] = _digest_challenge(
+            "realm-a",
+            nonce_a.decode(),
+            domain=f"http://{host_b}:{port_b}/ /a",
+        )
+        close_a = threading.Event()
+        server_a = Server(
+            make_handler(b"realm-a", nonce_a, seen_a, challenge_a),
+            requests_to_handle=3,
+            wait_to_close_event=close_a,
+        )
+        with server_a as (host_a, port_a):
+            url_a = f"http://{host_a}:{port_a}"
+            url_b = f"http://{host_b}:{port_b}"
+            with requests.Session() as s:
+                s.auth = auth
+                assert s.get(f"{url_a}/a").status_code == 200
+                assert s.get(f"{url_b}/b").status_code == 200
+                assert s.get(f"{url_a}/a/more").status_code == 200
+                assert s.get(f"{url_b}/b/more").status_code == 200
+            close_a.set()
+        close_b.set()
+
+    # Origin A: unauthenticated first request, then nc=1 on the retry, then
+    # a preemptive request continuing the nonce count.
+    assert len(seen_a) == 3
+    assert _authorization_line(seen_a[0]) is None
+    auth_a1 = _authorization_line(seen_a[1])
+    assert b'realm="realm-a"' in auth_a1
+    assert b'nonce="%s"' % nonce_a in auth_a1
+    assert b"nc=00000001" in auth_a1
+    auth_a2 = _authorization_line(seen_a[2])
+    assert b'nonce="%s"' % nonce_a in auth_a2
+    assert b"nc=00000002" in auth_a2
+
+    # Origin B: no state borrowed from origin A -- the first request carries
+    # no Authorization header despite A's challenge naming B in ``domain``,
+    # and B's nonce count starts from 1 independently.
+    assert len(seen_b) == 3
+    assert _authorization_line(seen_b[0]) is None
+    auth_b1 = _authorization_line(seen_b[1])
+    assert b'realm="realm-b"' in auth_b1
+    assert b'nonce="%s"' % nonce_b in auth_b1
+    assert b"nc=00000001" in auth_b1
+    auth_b2 = _authorization_line(seen_b[2])
+    assert b'nonce="%s"' % nonce_b in auth_b2
+    assert b"nc=00000002" in auth_b2
+
+
+def test_digestauth_multi_domain_same_origin_realms_and_path_boundary():
+    """On a single origin, two realms keep fully independent nonce counts,
+    and a domain of ``/alpha`` must not be widened to cover ``/alphax``.
+    """
+    nonce_alpha = b"aaaa0000aaaa0000aaaa0000aaaa0000"
+    nonce_beta = b"bbbb0000bbbb0000bbbb0000bbbb0000"
+    seen = []
+
+    def handler(sock):
+        request_content = consume_socket_content(sock, timeout=0.5)
+        seen.append(request_content)
+        if b"Authorization:" in request_content:
+            sock.send(_TEXT_200_CONNECTION_CLOSE)
+        else:
+            path = request_content.split(b" ", 2)[1]
+            if path.startswith(b"/beta"):
+                sock.send(
+                    _digest_challenge("realm-beta", nonce_beta.decode(), domain="/beta")
+                )
+            else:
+                sock.send(
+                    _digest_challenge("realm-alpha", nonce_alpha.decode(), domain="/alpha")
+                )
+        return request_content
+
+    auth = requests.auth.HTTPDigestAuth("user", "pass", multi_domain=True)
+    close_server = threading.Event()
+    server = Server(handler, requests_to_handle=8, wait_to_close_event=close_server)
+
+    with server as (host, port):
+        base = f"http://{host}:{port}"
+        with requests.Session() as s:
+            s.auth = auth
+            assert s.get(f"{base}/alpha/1").status_code == 200
+            assert s.get(f"{base}/beta/1").status_code == 200
+            assert s.get(f"{base}/alpha/2").status_code == 200
+            assert s.get(f"{base}/beta/2").status_code == 200
+            assert s.get(f"{base}/alphax").status_code == 200
+        close_server.set()
+
+    assert len(seen) == 8
+    # /alpha/1: challenged, then retried with nc=1.
+    assert _authorization_line(seen[0]) is None
+    assert b'nonce="%s"' % nonce_alpha in _authorization_line(seen[1])
+    assert b"nc=00000001" in _authorization_line(seen[1])
+    # /beta/1: a different realm on the same origin gets no preemptive
+    # Authorization and starts its own nonce count.
+    assert _authorization_line(seen[2]) is None
+    assert b'nonce="%s"' % nonce_beta in _authorization_line(seen[3])
+    assert b"nc=00000001" in _authorization_line(seen[3])
+    # /alpha/2 and /beta/2: preemptive, each continuing its own count.
+    assert b'nonce="%s"' % nonce_alpha in _authorization_line(seen[4])
+    assert b"nc=00000002" in _authorization_line(seen[4])
+    assert b'nonce="%s"' % nonce_beta in _authorization_line(seen[5])
+    assert b"nc=00000002" in _authorization_line(seen[5])
+    # /alphax: "/alpha" must not match "/alphax", so this request waits for
+    # its own challenge; the retry continues realm-alpha's count at nc=3.
+    assert _authorization_line(seen[6]) is None
+    assert b'nonce="%s"' % nonce_alpha in _authorization_line(seen[7])
+    assert b"nc=00000003" in _authorization_line(seen[7])
+
+
+def test_digestauth_multi_domain_cache_limit_and_stale_isolation():
+    """The protection-space cache is bounded, and a stale update resets only
+    the nonce count of the protection space it was issued for.
+    """
+    from requests.auth import _MAX_CACHED_PROTECTION_SPACES
+
+    auth = requests.auth.HTTPDigestAuth("user", "pass", multi_domain=True)
+    auth.init_per_thread_state()
+
+    for i in range(_MAX_CACHED_PROTECTION_SPACES + 10):
+        auth._learn_protection_space(
+            f"http://host{i}.example/", {"realm": "r", "nonce": f"n{i}"}
+        )
+    spaces = auth._thread_local.protection_spaces
+    assert len(spaces) == _MAX_CACHED_PROTECTION_SPACES
+    # Oldest entries were evicted first.
+    assert (("http", "host0.example", 80), "r") not in spaces
+    newest = ("http", f"host{_MAX_CACHED_PROTECTION_SPACES + 9}.example", 80)
+    assert (newest, "r") in spaces
+
+    # A stale challenge resets only its own protection space's count.
+    space_a = auth._learn_protection_space(
+        "http://a.example/", {"realm": "ra", "nonce": "na"}
+    )
+    space_b = auth._learn_protection_space(
+        "http://a.example/", {"realm": "rb", "nonce": "nb"}
+    )
+    space_a.last_nonce, space_a.nonce_count = "na", 7
+    space_b.last_nonce, space_b.nonce_count = "nb", 3
+    auth._learn_protection_space(
+        "http://a.example/", {"realm": "ra", "nonce": "na2", "stale": "true"}
+    )
+    assert space_a.chal["nonce"] == "na2"
+    assert space_a.last_nonce == ""
+    assert space_a.nonce_count == 0
+    assert space_b.last_nonce == "nb"
+    assert space_b.nonce_count == 3
+
+
+def test_digestauth_domain_path_boundary_and_port_normalization():
+    """Domain matching is segment-aware, default ports are normalized, and
+    cross-origin domain entries are dropped.
+    """
+    from requests.auth import (
+        _domain_covers_path,
+        _normalized_origin,
+        _parse_domain_directive,
+    )
+
+    assert _domain_covers_path("/api", "/api")
+    assert _domain_covers_path("/api", "/api/users")
+    assert _domain_covers_path("/api/", "/api/users")
+    assert _domain_covers_path("/", "/anything")
+    assert not _domain_covers_path("/api", "/apix")
+    assert not _domain_covers_path("/api", "/apiX")
+    assert not _domain_covers_path("/api", "/ap")
+
+    assert _normalized_origin("http://example.com/") == ("http", "example.com", 80)
+    assert _normalized_origin("http://example.com:80/") == ("http", "example.com", 80)
+    assert _normalized_origin("https://EXAMPLE.com/path") == (
+        "https", "example.com", 443,
+    )
+    assert _normalized_origin("http://example.com:8080/") == (
+        "http", "example.com", 8080,
+    )
+
+    origin = ("http", "example.com", 80)
+    assert _parse_domain_directive("/a http://example.com/b", origin) == ("/a", "/b")
+    assert _parse_domain_directive("http://example.com:80/b", origin) == ("/b",)
+    # External origins (including the same host on a non-default port) are
+    # never authorized by a domain directive.
+    external = "http://evil.example/ http://example.com:8080/x"
+    assert _parse_domain_directive(external, origin) == ()
+
+
 _schemes_by_var_prefix = [
     ('http', ['http']),
     ('https', ['https']),
