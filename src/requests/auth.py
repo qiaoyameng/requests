@@ -17,9 +17,10 @@ from base64 import b64encode
 from typing import TYPE_CHECKING, Any, Final, cast, overload
 
 from ._internal_utils import to_native_string
-from .compat import basestring, str, urlparse
+from .compat import basestring, str, urljoin, urlparse
 from .cookies import extract_cookies_to_jar
-from .utils import parse_dict_header
+from .exceptions import UnrewindableBodyError
+from .utils import DEFAULT_PORTS, parse_dict_header
 
 if TYPE_CHECKING:
     from http.cookiejar import CookieJar
@@ -153,8 +154,11 @@ class HTTPDigestAuth(AuthBase):
             self._thread_local.chal = {}
             self._thread_local.pos = None
             self._thread_local.num_401_calls = None
+            self._thread_local.stale_retries = 0
 
-    def build_digest_header(self, method: str, url: str) -> str | None:
+    def build_digest_header(
+        self, method: str, url: str, body: Any = None
+    ) -> str | None:
         """
         :rtype: str
         """
@@ -165,6 +169,7 @@ class HTTPDigestAuth(AuthBase):
         algorithm = self._thread_local.chal.get("algorithm")
         opaque = self._thread_local.chal.get("opaque")
         hash_utf8 = None
+        hash_name = None
 
         if algorithm is None:
             _algorithm = "MD5"
@@ -172,6 +177,7 @@ class HTTPDigestAuth(AuthBase):
             _algorithm = algorithm.upper()
         # lambdas assume digest modules are imported at the top level
         if _algorithm == "MD5" or _algorithm == "MD5-SESS":
+            hash_name = "md5"
 
             def md5_utf8(x: str | bytes) -> str:
                 if isinstance(x, str):
@@ -180,6 +186,7 @@ class HTTPDigestAuth(AuthBase):
 
             hash_utf8 = md5_utf8
         elif _algorithm == "SHA":
+            hash_name = "sha1"
 
             def sha_utf8(x: str | bytes) -> str:
                 if isinstance(x, str):
@@ -188,6 +195,7 @@ class HTTPDigestAuth(AuthBase):
 
             hash_utf8 = sha_utf8
         elif _algorithm == "SHA-256":
+            hash_name = "sha256"
 
             def sha256_utf8(x: str | bytes) -> str:
                 if isinstance(x, str):
@@ -196,6 +204,7 @@ class HTTPDigestAuth(AuthBase):
 
             hash_utf8 = sha256_utf8
         elif _algorithm == "SHA-512":
+            hash_name = "sha512"
 
             def sha512_utf8(x: str | bytes) -> str:
                 if isinstance(x, str):
@@ -210,8 +219,57 @@ class HTTPDigestAuth(AuthBase):
         def KD(s: str, d: str) -> str:
             return hash_utf8(f"{s}:{d}")
 
-        # XXX not implemented yet
-        entdig = None
+        def entity_digest(entity_body: Any) -> str:
+            if entity_body is None:
+                return hash_utf8(b"")
+            if isinstance(entity_body, (bytes, bytearray, memoryview)):
+                return hash_utf8(bytes(entity_body))
+            if isinstance(entity_body, str):
+                return hash_utf8(entity_body.encode("utf-8"))
+
+            tell = getattr(entity_body, "tell", None)
+            seek = getattr(entity_body, "seek", None)
+            read = getattr(entity_body, "read", None)
+            if not callable(tell) or not callable(seek) or not callable(read):
+                raise UnrewindableBodyError(
+                    "Cannot compute digest authentication with an unreplayable "
+                    "request body. Provide bytes or a seekable binary stream."
+                )
+
+            try:
+                body_position = tell()
+            except OSError as e:
+                raise UnrewindableBodyError(
+                    "Unable to determine request body position for digest "
+                    "authentication."
+                ) from e
+
+            assert hash_name is not None
+            digest = hashlib.new(hash_name, usedforsecurity=False)
+            try:
+                seek(body_position)
+                while chunk := read(65536):
+                    if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                        raise UnrewindableBodyError(
+                            "Digest authentication requires binary request body "
+                            "streams."
+                        )
+                    digest.update(chunk)
+            except OSError as e:
+                raise UnrewindableBodyError(
+                    "Unable to replay request body for digest authentication."
+                ) from e
+            finally:
+                try:
+                    seek(body_position)
+                except OSError as e:
+                    raise UnrewindableBodyError(
+                        "Unable to restore request body position after digest "
+                        "authentication."
+                    ) from e
+
+            return digest.hexdigest()
+
         p_parsed = urlparse(url)
         #: path is request-uri defined in RFC 2616 which should not be empty
         path = p_parsed.path or "/"
@@ -238,13 +296,27 @@ class HTTPDigestAuth(AuthBase):
         if _algorithm == "MD5-SESS":
             HA1 = hash_utf8(f"{HA1}:{nonce}:{cnonce}")  # type: ignore[reportConstantRedefinition]  # RFC 2617 terminology
 
+        qop_options = {
+            option.strip() for option in qop.split(",") if option.strip()
+        } if qop else set()
+
+        entdig = None
+
         if not qop:
             respdig = KD(HA1, f"{nonce}:{HA2}")
-        elif qop == "auth" or "auth" in qop.split(","):
+        elif "auth" in qop_options:
+            entdig = None
+            HA2 = hash_utf8(A2)
             noncebit = f"{nonce}:{ncvalue}:{cnonce}:auth:{HA2}"
             respdig = KD(HA1, noncebit)
+            qop = "auth"
+        elif "auth-int" in qop_options:
+            entdig = entity_digest(body)
+            HA2 = hash_utf8(f"{method}:{path}:{entdig}")
+            noncebit = f"{nonce}:{ncvalue}:{cnonce}:auth-int:{HA2}"
+            respdig = KD(HA1, noncebit)
+            qop = "auth-int"
         else:
-            # XXX handle auth-int.
             return None
 
         self._thread_local.last_nonce = nonce
@@ -261,7 +333,7 @@ class HTTPDigestAuth(AuthBase):
         if entdig:
             base += f', digest="{entdig}"'
         if qop:
-            base += f', qop="auth", nc={ncvalue}, cnonce="{cnonce}"'
+            base += f', qop="{qop}", nc={ncvalue}, cnonce="{cnonce}"'
 
         return f"Digest {base}"
 
@@ -269,6 +341,45 @@ class HTTPDigestAuth(AuthBase):
         """Reset num_401_calls counter on redirects."""
         if r.is_redirect:
             self._thread_local.num_401_calls = 1
+            self._thread_local.stale_retries = 0
+            if r.request is not None:
+                self._deregister_for_cross_origin_redirect(r.request, r)
+
+    def _deregister_for_cross_origin_redirect(
+        self, request: PreparedRequest, response: Response
+    ) -> None:
+        location = response.headers.get("location")
+        if location is None:
+            return
+        target = urljoin(response.url, location)
+        if self._should_strip_auth(request.url, target):
+            request.deregister_hook("response", self.handle_401)
+
+    @staticmethod
+    def _should_strip_auth(old_url: str, new_url: str) -> bool:
+        old_parsed = urlparse(old_url)
+        new_parsed = urlparse(new_url)
+        if old_parsed.hostname != new_parsed.hostname:
+            return True
+        if (
+            old_parsed.scheme == "http"
+            and old_parsed.port in (80, None)
+            and new_parsed.scheme == "https"
+            and new_parsed.port in (443, None)
+        ):
+            return False
+
+        changed_port = old_parsed.port != new_parsed.port
+        changed_scheme = old_parsed.scheme != new_parsed.scheme
+        default_port = (DEFAULT_PORTS.get(old_parsed.scheme), None)
+        if (
+            not changed_scheme
+            and old_parsed.port in default_port
+            and new_parsed.port in default_port
+        ):
+            return False
+
+        return changed_port or changed_scheme
 
     def handle_401(self, r: Response, **kwargs: Any) -> Response:
         """
@@ -277,23 +388,33 @@ class HTTPDigestAuth(AuthBase):
         :rtype: requests.Response
         """
 
-        # If response is not 4xx, do not auth
-        # See https://github.com/psf/requests/issues/3772
-        if not 400 <= r.status_code < 500:
-            self._thread_local.num_401_calls = 1
-            return r
+        initial_request = r.request
 
-        if self._thread_local.pos is not None:
-            # Rewind the file position indicator of the body to where
-            # it was to resend the request.
-            if (seek := getattr(r.request.body, "seek", None)) is not None:
-                seek(self._thread_local.pos)
-        s_auth = r.headers.get("www-authenticate", "")
+        while 400 <= r.status_code < 500:
+            if self._thread_local.pos is not None:
+                # Rewind the file position indicator of the body to where
+                # it was to resend the request.
+                if (seek := getattr(r.request.body, "seek", None)) is not None:
+                    seek(self._thread_local.pos)
 
-        if "digest" in s_auth.lower() and self._thread_local.num_401_calls < 2:
-            self._thread_local.num_401_calls += 1
+            s_auth = r.headers.get("www-authenticate", "")
             pat = re.compile(r"digest ", flags=re.IGNORECASE)
-            self._thread_local.chal = parse_dict_header(pat.sub("", s_auth, count=1))
+            is_digest_challenge = "digest" in s_auth.lower()
+            if not is_digest_challenge:
+                break
+
+            chal = parse_dict_header(pat.sub("", s_auth, count=1))
+            stale = chal.get("stale", "").lower() == "true"
+            stale_retry_available = stale and not self._thread_local.stale_retries
+            if self._thread_local.num_401_calls >= 2 and not stale_retry_available:
+                break
+
+            if stale:
+                self._thread_local.stale_retries += 1
+                self._thread_local.num_401_calls = 2
+            else:
+                self._thread_local.num_401_calls += 1
+            self._thread_local.chal = chal
 
             # Consume content and release the original connection
             # to allow our new request to reuse the same one.
@@ -305,26 +426,31 @@ class HTTPDigestAuth(AuthBase):
             prep.prepare_cookies(cookie_jar)
 
             _digest_auth = self.build_digest_header(
-                cast(str, prep.method), cast(str, prep.url)
+                cast(str, prep.method), cast(str, prep.url), prep.body
             )
             if _digest_auth:
                 prep.headers["Authorization"] = _digest_auth
-            _r = r.connection.send(prep, **kwargs)
-            _r.history.append(r)
-            _r.request = prep
+            previous_response = r
+            r = r.connection.send(prep, **kwargs)
+            r.history.append(previous_response)
+            r.request = prep
+            if r.is_redirect:
+                self._deregister_for_cross_origin_redirect(initial_request, r)
+                self._deregister_for_cross_origin_redirect(prep, r)
 
-            return _r
-
-        self._thread_local.num_401_calls = 1
+        if not 400 <= r.status_code < 500:
+            self._thread_local.num_401_calls = 1
         return r
 
     def __call__(self, r: PreparedRequest) -> PreparedRequest:
         # Initialize per-thread state, if needed
         self.init_per_thread_state()
+        self._thread_local.num_401_calls = 1
+        self._thread_local.stale_retries = 0
         # If we have a saved nonce, skip the 401
         if self._thread_local.last_nonce:
             _digest_auth = self.build_digest_header(
-                cast(str, r.method), cast(str, r.url)
+                cast(str, r.method), cast(str, r.url), r.body
             )
             if _digest_auth:
                 r.headers["Authorization"] = _digest_auth
@@ -338,7 +464,6 @@ class HTTPDigestAuth(AuthBase):
             self._thread_local.pos = None
         r.register_hook("response", self.handle_401)
         r.register_hook("response", self.handle_redirect)
-        self._thread_local.num_401_calls = 1
 
         return r
 

@@ -1,12 +1,39 @@
+import hashlib
+import io
 import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import pytest
 
 import requests
 from requests.compat import JSONDecodeError
+from requests.exceptions import UnrewindableBodyError
 from tests.testserver.server import Server, consume_socket_content
 
 from .utils import override_environ
+
+
+@contextmanager
+def _http_server(handler):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def _parse_digest_header(value):
+    params = {}
+    for item in value[len("Digest ") :].split(","):
+        key, item_value = item.strip().split("=", 1)
+        params[key] = item_value.strip('"')
+    return params
 
 
 def echo_response_handler(sock):
@@ -270,6 +297,262 @@ def test_digestauth_only_on_4xx():
         assert r.status_code == 200
         assert len(r.history) == 0
         close_server.set()
+
+
+def test_digestauth_auth_int_binary_stream_and_stale():
+    realm = "auth-int-test"
+    username = "user"
+    password = "pass"
+    body = bytes(range(256))
+    prefix = b"skipped bytes"
+    state = {"nonce": "first-nonce", "requests": 0, "cnonces": []}
+
+    class DigestAuthIntHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format, *args):
+            pass
+
+        def do_POST(self):
+            state["requests"] += 1
+            length = int(self.headers["Content-Length"])
+            received_body = self.rfile.read(length)
+
+            if state["requests"] == 1:
+                assert "Authorization" not in self.headers
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.send_header(
+                    "WWW-Authenticate",
+                    f'Digest realm="{realm}", nonce="{state["nonce"]}", '
+                    'qop="auth-int"',
+                )
+                self.end_headers()
+                return
+
+            params = _parse_digest_header(self.headers["Authorization"])
+            assert received_body == body
+            assert params["qop"] == "auth-int"
+            assert params["nonce"] == state["nonce"]
+            assert params["nc"] == "00000001"
+            state["cnonces"].append(params["cnonce"])
+
+            entity_hash = hashlib.md5(received_body).hexdigest()
+            assert params["digest"] == entity_hash
+            ha1 = hashlib.md5(
+                f"{username}:{realm}:{password}".encode()
+            ).hexdigest()
+            ha2 = hashlib.md5(
+                f"POST:{self.path}:{entity_hash}".encode()
+            ).hexdigest()
+            expected = hashlib.md5(
+                f'{ha1}:{params["nonce"]}:{params["nc"]}:{params["cnonce"]}:'
+                f'auth-int:{ha2}'.encode()
+            ).hexdigest()
+            assert params["response"] == expected
+
+            if state["requests"] == 2:
+                state["nonce"] = "second-nonce"
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.send_header(
+                    "WWW-Authenticate",
+                    f'Digest realm="{realm}", nonce="{state["nonce"]}", '
+                    'qop="auth-int", stale="true"',
+                )
+                self.end_headers()
+                return
+
+            assert params["nonce"] == "second-nonce"
+            assert state["cnonces"][0] != state["cnonces"][1]
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+    stream = io.BytesIO(prefix + body)
+    stream.seek(len(prefix))
+
+    with _http_server(DigestAuthIntHandler) as server:
+        host, port = server.server_address
+        response = requests.post(
+            f"http://{host}:{port}/resource",
+            data=stream,
+            auth=requests.auth.HTTPDigestAuth(username, password),
+        )
+
+    assert response.status_code == 200
+    assert state["requests"] == 3
+    assert stream.tell() == len(prefix) + len(body)
+
+
+def test_digestauth_auth_int_hashes_exact_body_bytes():
+    body = bytes(range(256))
+    auth = requests.auth.HTTPDigestAuth("user", "pass")
+    auth.init_per_thread_state()
+    auth._thread_local.chal = {
+        "realm": "test",
+        "nonce": "nonce",
+        "qop": "auth-int",
+    }
+
+    expected = hashlib.md5(body).hexdigest()
+    header = auth.build_digest_header("POST", "http://example.test/", body)
+
+    assert f'digest="{expected}"' in header
+    assert 'qop="auth-int"' in header
+
+
+def test_digestauth_auth_int_restores_seekable_stream_position():
+    body = bytes(range(256))
+    stream = io.BytesIO(b"prefix" + body)
+    stream.seek(6)
+    auth = requests.auth.HTTPDigestAuth("user", "pass")
+    auth.init_per_thread_state()
+    auth._thread_local.chal = {
+        "realm": "test",
+        "nonce": "nonce",
+        "qop": "auth-int",
+    }
+
+    header = auth.build_digest_header(
+        "POST", "http://example.test/", stream
+    )
+
+    assert f'digest="{hashlib.md5(body).hexdigest()}"' in header
+    assert stream.tell() == 6
+
+
+def test_digestauth_auth_int_rejects_unreplayable_body():
+    auth = requests.auth.HTTPDigestAuth("user", "pass")
+    auth.init_per_thread_state()
+    auth._thread_local.chal = {
+        "realm": "test",
+        "nonce": "nonce",
+        "qop": "auth-int",
+    }
+
+    with pytest.raises(UnrewindableBodyError):
+        auth.build_digest_header(
+            "POST", "http://example.test/", iter([b"not replayable"])
+        )
+
+
+def test_digestauth_strips_header_on_cross_origin_redirect(monkeypatch):
+    session = requests.Session()
+    monkeypatch.setattr(
+        session, "should_strip_auth", lambda old_url, new_url: True
+    )
+    auth = requests.auth.HTTPDigestAuth("user", "pass")
+    original = requests.Request(
+        "GET",
+        "http://origin.test/resource",
+        headers={"Authorization": "Digest credentials"},
+        auth=auth,
+    ).prepare()
+    redirect_response = SimpleNamespace(
+        is_redirect=True,
+        url=original.url,
+        headers={"location": "http://other-origin.test/resource"},
+        request=original,
+    )
+    auth.handle_redirect(redirect_response)
+    redirected = requests.Request(
+        "GET",
+        "http://other-origin.test/resource",
+        headers={"Authorization": "Digest credentials"},
+    ).prepare()
+    redirected.hooks = original.hooks
+    session.rebuild_auth(redirected, redirect_response)
+
+    assert "Authorization" not in redirected.headers
+    assert auth.handle_401 not in redirected.hooks["response"]
+
+
+def test_digestauth_keeps_header_and_hook_on_same_origin_redirect():
+    auth = requests.auth.HTTPDigestAuth("user", "pass")
+    original = requests.Request(
+        "GET",
+        "http://origin.test/resource",
+        headers={"Authorization": "Digest credentials"},
+        auth=auth,
+    ).prepare()
+    redirect_response = SimpleNamespace(
+        is_redirect=True,
+        url=original.url,
+        headers={"location": "/next"},
+        request=original,
+    )
+    redirected = requests.Request(
+        "GET",
+        "http://origin.test/next",
+        headers={"Authorization": "Digest credentials"},
+    ).prepare()
+    redirected.hooks = original.hooks
+
+    auth.handle_redirect(redirect_response)
+
+    assert "Authorization" in redirected.headers
+    assert auth.handle_401 in redirected.hooks["response"]
+
+
+def test_digestauth_deregisters_after_challenge_cross_origin_redirect():
+    auth = requests.auth.HTTPDigestAuth("user", "pass")
+    initial_request = requests.Request(
+        "GET",
+        "http://origin.test/resource",
+        auth=auth,
+    ).prepare()
+
+    class Connection:
+        def send(self, request, **kwargs):
+            return SimpleNamespace(
+                status_code=302,
+                is_redirect=True,
+                headers={"location": "http://other-origin.test/resource"},
+                url=request.url,
+                history=[],
+                request=request,
+            )
+
+    challenge = SimpleNamespace(
+        status_code=401,
+        headers={
+            "www-authenticate": 'Digest realm="test", nonce="nonce", qop="auth"'
+        },
+        raw=SimpleNamespace(_original_response=None),
+        content=b"",
+        history=[],
+        connection=Connection(),
+        request=initial_request,
+        close=lambda: None,
+    )
+
+    redirect = auth.handle_401(challenge)
+
+    assert redirect.status_code == 302
+    assert auth.handle_401 not in initial_request.hooks["response"]
+
+
+def test_digestauth_resets_stale_retry_for_new_request():
+    auth = requests.auth.HTTPDigestAuth("user", "pass")
+    first = requests.Request(
+        "POST",
+        "http://example.test/first",
+        data=b"first",
+        auth=auth,
+    ).prepare()
+    auth._thread_local.stale_retries = 1
+
+    second = requests.Request(
+        "POST",
+        "http://example.test/second",
+        data=b"second",
+        auth=auth,
+    ).prepare()
+
+    assert auth._thread_local.stale_retries == 0
+    assert second is not first
 
 
 _schemes_by_var_prefix = [
