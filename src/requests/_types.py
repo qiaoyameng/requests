@@ -63,7 +63,7 @@ if TYPE_CHECKING:
 
     from .auth import AuthBase
     from .cookies import RequestsCookieJar
-    from .models import PreparedRequest, Response
+    from .models import BodyFactory, PreparedRequest, Response
     from .structures import CaseInsensitiveDict
 
     class _ValidatedRequest(PreparedRequest):
@@ -107,6 +107,7 @@ if TYPE_CHECKING:
         | bytes
         | Buffer
         | SupportsRead[str | bytes]
+        | BodyFactory
         | None
     )
 

@@ -386,6 +386,35 @@ parameter of ``None``. If you want to set a maximum size of the chunk,
 you can set a ``chunk_size`` parameter to any integer.
 
 
+.. _body-factories:
+
+Body Factories
+--------------
+
+Some uploads come from streams that cannot be rewound or reused, such as a
+temporary decompression stream. If such a request is answered with a
+redirect that keeps the body (307 or 308), the consumed stream cannot be
+sent again. For these cases, pass a :class:`requests.BodyFactory` subclass
+as ``data``. Requests calls :meth:`~requests.BodyFactory.create` lazily,
+once per actual send, and closes each produced stream exactly once after
+that send completes or fails::
+
+    class CompressedUpload(requests.BodyFactory):
+        content_length = 1024  # declare if known, else chunked is used
+
+        def create(self):
+            return open_compressed_stream()
+
+    requests.post('http://some.url/upload', data=CompressedUpload())
+
+The factory is never called while preparing or copying a request, and
+produced streams are never shared between sends. If ``content_length`` is
+declared, every produced stream must honor it; a detectable mismatch raises
+a ``ValueError`` instead of sending a stale ``Content-Length``. Redirects
+that change the method (e.g. 303 to GET) drop the body, so no further
+stream is created for them.
+
+
 .. _multipart:
 
 POST Multiple Multipart-Encoded Files

@@ -181,11 +181,12 @@ from .exceptions import (
     TooManyRedirects,
     URLRequired,
 )
-from .models import PreparedRequest, Request, Response
+from .models import BodyFactory, PreparedRequest, Request, Response
 from .sessions import Session, session
 from .status_codes import codes
 
 __all__ = (
+    "BodyFactory",
     "ConnectionError",
     "ConnectTimeout",
     "HTTPError",

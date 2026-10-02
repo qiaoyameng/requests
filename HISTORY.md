@@ -4,7 +4,11 @@ Release History
 dev
 ---
 
-- \[Short description of non-trivial change.\]
+- Added `requests.BodyFactory`: pass an instance as `data` to lazily create
+  a fresh body stream for each actual send (e.g. non-seekable temporary
+  streams). Each produced stream is closed exactly once by the send that
+  created it, redirects that keep the body (307/308) resend a fresh stream,
+  and an optional declared `content_length` is enforced on every send.
 
 
 2.34.2 (2026-05-14)

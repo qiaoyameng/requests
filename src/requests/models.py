@@ -105,6 +105,37 @@ CONTENT_CHUNK_SIZE: int = 10 * 1024
 ITER_CHUNK_SIZE: int = 512
 
 
+class BodyFactory:
+    """Factory interface for request bodies that cannot be reused.
+
+    Uploading from a non-seekable stream (e.g. a temporary compressed
+    stream) breaks on redirects like 307/308, because the consumed stream
+    cannot be rewound for the resend. Subclass this and pass an instance as
+    ``data`` to have Requests ask for a fresh body stream immediately before
+    each actual send instead.
+
+    The contract:
+
+    * :meth:`create` is called lazily, once per actual send. Preparing or
+      copying a request never calls it, and produced streams are never
+      shared between sends.
+    * Each produced stream is owned by the send that created it: Requests
+      closes it exactly once after that send completes or fails.
+    * :attr:`content_length` optionally declares the length of every
+      produced stream. Each created stream must honor the declared length;
+      a detectable mismatch raises a :class:`ValueError` instead of
+      sending a stale ``Content-Length``. When ``None``, the body is sent
+      with ``Transfer-Encoding: chunked``.
+    """
+
+    #: Declared length of each produced stream, or None if unknown.
+    content_length: int | None = None
+
+    def create(self) -> _t.BodyType:
+        """Return a fresh, unread body stream for a single send."""
+        raise NotImplementedError
+
+
 class RequestEncodingMixin:
     url: str | None
 
@@ -403,6 +434,7 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
     body: _t.BodyType
     hooks: dict[str, list[_t.HookType]]
     _body_position: int | object | None
+    body_factory: BodyFactory | None
 
     def __init__(self) -> None:
         #: HTTP verb to send to the server.
@@ -420,6 +452,8 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         self.hooks = default_hooks()
         #: integer denoting starting position of a readable file-like body.
         self._body_position = None
+        #: factory producing a fresh body stream for each actual send.
+        self.body_factory = None
 
     def prepare(
         self,
@@ -462,6 +496,9 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         p.body = self.body
         p.hooks = self.hooks
         p._body_position = self._body_position
+        # Only the factory description is carried over. It is not called
+        # here, and no produced (possibly consumed) stream is shared.
+        p.body_factory = self.body_factory
         return p
 
     def prepare_method(self, method: str | None) -> None:
@@ -585,6 +622,23 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         body = None
         content_type = None
 
+        if isinstance(data, BodyFactory):
+            # The factory is only a description of how to obtain a body;
+            # no stream is created (or consumed) until the actual send.
+            if files:
+                raise NotImplementedError(
+                    "Body factories and files are mutually exclusive."
+                )
+
+            self.body_factory = data
+            self.body = None
+
+            if data.content_length is not None:
+                self.headers["Content-Length"] = builtin_str(data.content_length)
+            else:
+                self.headers["Transfer-Encoding"] = "chunked"
+            return
+
         if not data and json is not None:
             # urllib3 requires a bytes-like body. Python 2's json.dumps
             # provides this natively, but Python 3 gives a Unicode string.
@@ -653,6 +707,11 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
 
     def prepare_content_length(self, body: _t.BodyType) -> None:
         """Prepare Content-Length header based on request method and body"""
+        if self.body_factory is not None:
+            # The length contract is declared by the factory and enforced
+            # against each produced stream at send time.
+            return
+
         if body is not None:
             length = super_len(body)
             if length:

@@ -34,7 +34,7 @@ from urllib3.util import parse_url
 from urllib3.util.retry import Retry
 
 from .auth import _basic_auth_str
-from .compat import basestring, urlparse
+from .compat import basestring, builtin_str, urlparse
 from .cookies import extract_cookies_to_jar
 from .exceptions import (
     ConnectionError,
@@ -56,6 +56,7 @@ from .utils import (
     get_encoding_from_headers,
     prepend_scheme_if_needed,
     select_proxy,
+    super_len,
     urldefragauth,
 )
 
@@ -117,6 +118,25 @@ def _urllib3_request_context(
         "port": port,
     }
     return host_params, pool_kwargs
+
+
+def _determinable_length(body: Any) -> int | None:
+    """Return the body's length when it can be determined without consuming
+    the body, otherwise None."""
+    if hasattr(body, "__len__") or hasattr(body, "len"):
+        return super_len(body)
+    if hasattr(body, "seek") and hasattr(body, "tell"):
+        try:
+            return super_len(body)
+        except OSError:
+            return None
+    return None
+
+
+def _close_body(body: Any) -> None:
+    close = getattr(body, "close", None)
+    if close is not None:
+        close()
 
 
 class BaseAdapter:
@@ -676,73 +696,100 @@ class HTTPAdapter(BaseAdapter):
             proxies=proxies,
         )
 
-        chunked = not (request.body is None or "Content-Length" in request.headers)
-
-        if isinstance(timeout, tuple):
-            try:
-                connect, read = timeout
-                resolved_timeout = TimeoutSauce(connect=connect, read=read)
-            except ValueError:
-                raise ValueError(
-                    f"Invalid timeout {timeout}. Pass a (connect, read) timeout tuple, "
-                    f"or a single float to set both timeouts to the same value."
-                )
-        elif isinstance(timeout, TimeoutSauce):
-            resolved_timeout = timeout
-        else:
-            resolved_timeout = TimeoutSauce(connect=timeout, read=timeout)
-
+        # A body factory produces a fresh stream for this send only. The
+        # stream is owned by this send and closed exactly once below,
+        # whether the send succeeds, fails, or the response is closed.
+        created_body = None
         try:
-            resp = conn.urlopen(
-                method=request.method,
-                url=url,
-                body=request.body,  # type: ignore[arg-type]  # urllib3 stubs don't accept Iterable[bytes | str]
-                headers=request.headers,  # type: ignore[arg-type]  # urllib3#3072
-                redirect=False,
-                assert_same_host=False,
-                preload_content=False,
-                decode_content=False,
-                retries=self.max_retries,
-                timeout=resolved_timeout,
-                chunked=chunked,
-            )
+            body = request.body
+            body_factory = request.body_factory
+            if body_factory is not None:
+                created_body = body_factory.create()
+                body = created_body
 
-        except (ProtocolError, OSError) as err:
-            raise ConnectionError(err, request=request)
+                declared_length = body_factory.content_length
+                if declared_length is not None:
+                    # Enforce the declared contract on every produced
+                    # stream instead of reusing a stale Content-Length.
+                    request.headers["Content-Length"] = builtin_str(declared_length)
+                    actual_length = _determinable_length(created_body)
+                    if actual_length is not None and actual_length != declared_length:
+                        raise ValueError(
+                            f"Body factory declared a Content-Length of "
+                            f"{declared_length} but produced a body of length "
+                            f"{actual_length}."
+                        )
 
-        except MaxRetryError as e:
-            if isinstance(e.reason, ConnectTimeoutError):
-                # TODO: Remove this in 3.0.0: see #2811
-                if not isinstance(e.reason, NewConnectionError):
-                    raise ConnectTimeout(e, request=request)
+            chunked = not (body is None or "Content-Length" in request.headers)
 
-            if isinstance(e.reason, ResponseError):
-                raise RetryError(e, request=request)
-
-            if isinstance(e.reason, _ProxyError):
-                raise ProxyError(e, request=request)
-
-            if isinstance(e.reason, _SSLError):
-                # This branch is for urllib3 v1.22 and later.
-                raise SSLError(e, request=request)
-
-            raise ConnectionError(e, request=request)
-
-        except ClosedPoolError as e:
-            raise ConnectionError(e, request=request)
-
-        except _ProxyError as e:
-            raise ProxyError(e)
-
-        except (_SSLError, _HTTPError) as e:
-            if isinstance(e, _SSLError):
-                # This branch is for urllib3 versions earlier than v1.22
-                raise SSLError(e, request=request)
-            elif isinstance(e, ReadTimeoutError):
-                raise ReadTimeout(e, request=request)
-            elif isinstance(e, _InvalidHeader):
-                raise InvalidHeader(e, request=request)
+            if isinstance(timeout, tuple):
+                try:
+                    connect, read = timeout
+                    resolved_timeout = TimeoutSauce(connect=connect, read=read)
+                except ValueError:
+                    raise ValueError(
+                        f"Invalid timeout {timeout}. Pass a (connect, read) timeout tuple, "
+                        f"or a single float to set both timeouts to the same value."
+                    )
+            elif isinstance(timeout, TimeoutSauce):
+                resolved_timeout = timeout
             else:
-                raise
+                resolved_timeout = TimeoutSauce(connect=timeout, read=timeout)
 
-        return self.build_response(request, resp)
+            try:
+                resp = conn.urlopen(
+                    method=request.method,
+                    url=url,
+                    body=body,  # type: ignore[arg-type]  # urllib3 stubs don't accept Iterable[bytes | str]
+                    headers=request.headers,  # type: ignore[arg-type]  # urllib3#3072
+                    redirect=False,
+                    assert_same_host=False,
+                    preload_content=False,
+                    decode_content=False,
+                    retries=self.max_retries,
+                    timeout=resolved_timeout,
+                    chunked=chunked,
+                )
+
+            except (ProtocolError, OSError) as err:
+                raise ConnectionError(err, request=request)
+
+            except MaxRetryError as e:
+                if isinstance(e.reason, ConnectTimeoutError):
+                    # TODO: Remove this in 3.0.0: see #2811
+                    if not isinstance(e.reason, NewConnectionError):
+                        raise ConnectTimeout(e, request=request)
+
+                if isinstance(e.reason, ResponseError):
+                    raise RetryError(e, request=request)
+
+                if isinstance(e.reason, _ProxyError):
+                    raise ProxyError(e, request=request)
+
+                if isinstance(e.reason, _SSLError):
+                    # This branch is for urllib3 v1.22 and later.
+                    raise SSLError(e, request=request)
+
+                raise ConnectionError(e, request=request)
+
+            except ClosedPoolError as e:
+                raise ConnectionError(e, request=request)
+
+            except _ProxyError as e:
+                raise ProxyError(e)
+
+            except (_SSLError, _HTTPError) as e:
+                if isinstance(e, _SSLError):
+                    # This branch is for urllib3 versions earlier than v1.22
+                    raise SSLError(e, request=request)
+                elif isinstance(e, ReadTimeoutError):
+                    raise ReadTimeout(e, request=request)
+                elif isinstance(e, _InvalidHeader):
+                    raise InvalidHeader(e, request=request)
+                else:
+                    raise
+
+            return self.build_response(request, resp)
+        finally:
+            if created_body is not None:
+                _close_body(created_body)

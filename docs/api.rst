@@ -64,6 +64,9 @@ Lower-Lower-Level Classes
 .. autoclass:: requests.PreparedRequest
    :inherited-members:
 
+.. autoclass:: requests.BodyFactory
+   :members:
+
 .. autoclass:: requests.adapters.BaseAdapter
    :inherited-members:
 

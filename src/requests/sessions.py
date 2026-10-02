@@ -256,6 +256,9 @@ class SessionRedirectMixin:
                 for header in purged_headers:
                     prepared_request.headers.pop(header, None)
                 prepared_request.body = None
+                # The method changed (e.g. 303 -> GET): drop the factory as
+                # well so no further body stream is ever created.
+                prepared_request.body_factory = None
 
             headers = prepared_request.headers
             headers.pop("Cookie", None)
