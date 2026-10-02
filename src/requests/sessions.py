@@ -286,6 +286,10 @@ class SessionRedirectMixin:
             # Override the original request.
             req = prepared_request
 
+            # Carry the redirect hop onto the next request so the
+            # response it produces can be correlated with this hop.
+            req._redirect_hop = len(hist)
+
             if yield_requests:
                 yield req  # type: ignore[misc]  # Internal use only, returns PreparedRequest
             else:
@@ -786,6 +790,17 @@ class Session(SessionRedirectMixin):
         # Total elapsed time of the request (approximately)
         elapsed = preferred_clock() - start
         r.elapsed = timedelta(seconds=elapsed)
+
+        # Attach the hooks to the response so it can dispatch the
+        # one-shot "response_body" event when its body finishes
+        # downloading or is aborted, even if a "response" hook below
+        # consumes the body itself.
+        r.hooks = hooks
+        # Record which redirect hop this response belongs to. The hop is
+        # carried on the prepared request by resolve_redirects() because
+        # r.history is only populated after the whole chain resolves,
+        # which is too late for body events fired while redirecting.
+        r._redirect_hop = getattr(request, "_redirect_hop", 0)
 
         # Response manipulation hooks
         r = dispatch_hook("response", hooks, r, **kwargs)

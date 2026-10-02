@@ -431,6 +431,10 @@ Available hooks:
 ``response``:
     The response generated from a Request.
 
+``response_body``:
+    The body of a response has finished downloading, or will never
+    finish because reading it failed or the response was closed first.
+
 
 You can assign a hook function on a per-request basis by passing a
 ``{hook_name: callback_function}`` dictionary to the ``hooks`` request
@@ -457,6 +461,34 @@ anything, nothing else is affected.
     def record_hook(r, *args, **kwargs):
         r.hook_called = True
         return r
+
+The ``response_body`` hook works differently. It is a *notification*
+hook: it fires exactly once per response, no matter whether the body is
+consumed automatically (``stream=False``), by iterating with
+``stream=True``, or by accessing ``Response.content`` directly. A
+response that has only delivered its headers so far has not finished
+downloading and produces no event. The callback receives the response
+plus keyword arguments describing the outcome::
+
+    def body_done(r, hop, outcome, error, **kwargs):
+        print(f"hop {hop}: {r.url} -> {outcome}")
+
+``hop`` is the index of the response within its redirect chain (``0``
+for the first response, ``1`` for the first redirect, and so on), so an
+event can be correlated with ``r.history``. ``outcome`` is one of
+``"eof"`` (the body was read to completion), ``"error"`` (reading the
+body raised, and ``error`` holds the exception), or ``"close"`` (the
+response was closed before its body was fully consumed).
+
+Return values of ``response_body`` callbacks are ignored: the body that
+was already delivered cannot be replaced. A callback that calls
+``Response.close()`` itself does not retrigger the event. Exceptions
+raised by ``response_body`` callbacks are not swallowed; they propagate
+to the code that triggered the event (for example the caller of
+``iter_content``, ``content`` or ``close``). When a callback raises
+while an ``"error"`` outcome is being reported, the callback's
+exception replaces the original read error, which remains available as
+``__context__``.
 
 Let's print some request method arguments at runtime::
 

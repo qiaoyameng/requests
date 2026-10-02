@@ -4,7 +4,12 @@ Release History
 dev
 ---
 
-- \[Short description of non-trivial change.\]
+- Added a ``response_body`` event hook that fires exactly once per
+  response when its body finishes downloading (``outcome="eof"``),
+  reading fails (``outcome="error"``), or the response is closed early
+  (``outcome="close"``). The event reports the redirect ``hop`` so it
+  can be correlated with ``Response.history``; return values of the
+  callbacks are ignored.
 
 
 2.34.2 (2026-05-14)

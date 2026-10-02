@@ -66,7 +66,13 @@ from .exceptions import (
 )
 from .exceptions import JSONDecodeError as RequestsJSONDecodeError
 from .exceptions import SSLError as RequestsSSLError
-from .hooks import default_hooks
+from .hooks import (
+    BODY_OUTCOME_CLOSE,
+    BODY_OUTCOME_EOF,
+    BODY_OUTCOME_ERROR,
+    default_hooks,
+    dispatch_body_hook,
+)
 from .status_codes import codes
 from .structures import CaseInsensitiveDict
 from .utils import (
@@ -736,9 +742,12 @@ class Response:
 
     _content: bytes | Literal[False] | None
     _content_consumed: bool
+    _body_event_fired: bool
+    _redirect_hop: int
     _next: PreparedRequest | None
     status_code: int
     headers: CaseInsensitiveDict[str]
+    hooks: dict[str, list[_t.HookType]]
     raw: Any
     url: str
     encoding: str | None
@@ -765,7 +774,19 @@ class Response:
     def __init__(self) -> None:
         self._content = False
         self._content_consumed = False
+        self._body_event_fired = False
+        #: Index of this response within its redirect chain (0 for the
+        #: first response). Set by :meth:`Session.send` before the body
+        #: can be consumed, so ``response_body`` events can be
+        #: correlated with a redirect hop even though ``history`` is
+        #: only populated once the chain has fully resolved.
+        self._redirect_hop = 0
         self._next = None
+
+        #: dictionary of callback hooks, for internal usage. Populated by
+        #: :meth:`Session.send` so the one-shot ``response_body`` event
+        #: can be dispatched whenever the body finishes or is aborted.
+        self.hooks = default_hooks()
 
         #: Integer Code of responded HTTP Status, e.g. 404 or 200.
         self.status_code = None  # type: ignore[assignment]
@@ -830,6 +851,10 @@ class Response:
         # pickled objects do not have .raw
         setattr(self, "_content_consumed", True)
         setattr(self, "raw", None)
+        # pickled objects carry no live hooks and their body is consumed
+        setattr(self, "hooks", default_hooks())
+        setattr(self, "_body_event_fired", True)
+        setattr(self, "_redirect_hop", 0)
 
     def __repr__(self) -> str:
         return f"<Response [{self.status_code}]>"
@@ -893,6 +918,30 @@ class Response:
         """Returns a PreparedRequest for the next request in a redirect chain, if there is one."""
         return self._next
 
+    def _notify_body_event(
+        self, outcome: str, error: BaseException | None = None
+    ) -> None:
+        """Dispatches the one-shot ``response_body`` hook event.
+
+        The event fires exactly once per response, the first time the
+        body reaches EOF, a read fails, or the response is closed before
+        being fully consumed. The fired flag is set *before* dispatching,
+        so a hook that itself calls :meth:`close` cannot retrigger the
+        event. Return values of the callbacks are ignored; exceptions
+        they raise propagate to the caller that triggered the event.
+        """
+        if self._body_event_fired:
+            return
+        self._body_event_fired = True
+        dispatch_body_hook(
+            "response_body",
+            self.hooks,
+            self,
+            hop=self._redirect_hop,
+            outcome=outcome,
+            error=error,
+        )
+
     @property
     def apparent_encoding(self) -> str | None:
         """The apparent encoding, provided by the charset_normalizer or chardet libraries."""
@@ -934,26 +983,32 @@ class Response:
 
         def generate() -> Generator[bytes, None, None]:
             # Special case for urllib3.
-            if hasattr(self.raw, "stream"):
-                try:
-                    yield from self.raw.stream(chunk_size, decode_content=True)
-                except ProtocolError as e:
-                    raise ChunkedEncodingError(e)
-                except DecodeError as e:
-                    raise ContentDecodingError(e)
-                except ReadTimeoutError as e:
-                    raise ConnectionError(e)
-                except SSLError as e:
-                    raise RequestsSSLError(e)
-            else:
-                # Standard file-like object.
-                while True:
-                    chunk = self.raw.read(chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
+            try:
+                if hasattr(self.raw, "stream"):
+                    try:
+                        yield from self.raw.stream(chunk_size, decode_content=True)
+                    except ProtocolError as e:
+                        raise ChunkedEncodingError(e)
+                    except DecodeError as e:
+                        raise ContentDecodingError(e)
+                    except ReadTimeoutError as e:
+                        raise ConnectionError(e)
+                    except SSLError as e:
+                        raise RequestsSSLError(e)
+                else:
+                    # Standard file-like object.
+                    while True:
+                        chunk = self.raw.read(chunk_size)
+                        if not chunk:
+                            break
+                        yield chunk
+            except Exception as e:
+                # The download was interrupted by a read failure.
+                self._notify_body_event(BODY_OUTCOME_ERROR, error=e)
+                raise
 
             self._content_consumed = True
+            self._notify_body_event(BODY_OUTCOME_EOF)
 
         if self._content_consumed and isinstance(self._content, bool):
             raise StreamConsumedError()
@@ -1178,6 +1233,9 @@ class Response:
         """
         if not self._content_consumed:
             self.raw.close()
+            # The body will never be (fully) delivered. This is a no-op
+            # if the body already reached EOF or failed while reading.
+            self._notify_body_event(BODY_OUTCOME_CLOSE)
 
         release_conn = getattr(self.raw, "release_conn", None)
         if release_conn is not None:
