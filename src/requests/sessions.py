@@ -23,6 +23,8 @@ from .auth import _basic_auth_str
 from .compat import cookielib, urljoin, urlparse
 from .cookies import (
     RequestsCookieJar,
+    _copy_cookie_jar,
+    commit_cookie_jar,
     cookiejar_from_dict,
     extract_cookies_to_jar,
     merge_cookies,
@@ -508,6 +510,10 @@ class Session(SessionRedirectMixin):
     def __exit__(self, *args: Any) -> None:
         self.close()
 
+    def cookie_branch(self) -> CookieBranch:
+        """Return a session branch with isolated, explicitly committed cookies."""
+        return CookieBranch(self)
+
     def prepare_request(self, request: Request) -> PreparedRequest:
         """Constructs a :class:`PreparedRequest <PreparedRequest>` for
         transmission and returns it. The :class:`PreparedRequest` has settings
@@ -903,6 +909,47 @@ class Session(SessionRedirectMixin):
     def __setstate__(self, state: dict[str, Any]) -> None:
         for attr, value in state.items():
             setattr(self, attr, value)
+
+
+class CookieBranch(Session):
+    """A Session view that shares configuration but isolates cookie changes.
+
+    Requests use the parent session's connection adapters and current
+    configuration. Cookies are copied into a private jar, and normal exit or
+    close discards branch changes. Call :meth:`commit` to atomically publish
+    cookie additions, modifications, and deletions to the parent session.
+    """
+
+    def __init__(self, parent: Session) -> None:
+        self._parent = parent
+        self.headers = parent.headers
+        self.auth = parent.auth
+        self.proxies = parent.proxies
+        self.hooks = parent.hooks
+        self.params = parent.params
+        self.stream = parent.stream
+        self.verify = parent.verify
+        self.cert = parent.cert
+        self.max_redirects = parent.max_redirects
+        self.trust_env = parent.trust_env
+        self.cookies = _copy_cookie_jar(parent.cookies)  # type: ignore[assignment]
+        self._baseline = cast(cookielib.CookieJar, _copy_cookie_jar(parent.cookies))
+        self.adapters = parent.adapters
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def commit(self) -> None:
+        """Atomically merge this branch's cookie changes into the parent."""
+        if self._closed:
+            raise RuntimeError("Cannot commit a closed cookie branch")
+        commit_cookie_jar(self._parent.cookies, self.cookies, self._baseline)
+
+    def close(self) -> None:
+        """Discard branch state without closing the parent's adapters."""
+        self._closed = True
 
 
 def session() -> Session:

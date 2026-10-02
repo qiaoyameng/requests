@@ -169,6 +169,7 @@ from .__version__ import (
     __version__,
 )
 from .api import delete, get, head, options, patch, post, put, request
+from .cookies import CookieBranchConflictError
 from .exceptions import (
     ConnectionError,
     ConnectTimeout,
@@ -182,12 +183,14 @@ from .exceptions import (
     URLRequired,
 )
 from .models import PreparedRequest, Request, Response
-from .sessions import Session, session
+from .sessions import CookieBranch, Session, session
 from .status_codes import codes
 
 __all__ = (
     "ConnectionError",
     "ConnectTimeout",
+    "CookieBranch",
+    "CookieBranchConflictError",
     "HTTPError",
     "JSONDecodeError",
     "PreparedRequest",

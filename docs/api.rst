@@ -46,6 +46,20 @@ Request Sessions
 .. autoclass:: Session
    :inherited-members:
 
+.. autoclass:: CookieBranch
+   :inherited-members:
+
+Use ``Session.cookie_branch()`` when a sequence of requests should share the
+session's connection and configuration but update cookies only after the whole
+sequence succeeds:
+
+.. code-block:: python
+
+    with session.cookie_branch() as branch:
+        branch.get("https://example.com/login")
+        branch.get("https://example.com/finalize")
+        branch.commit()  # Leaving the context without committing discards cookies.
+
 
 Lower-Level Classes
 -------------------
@@ -102,6 +116,9 @@ Cookies
 
 .. autoclass:: requests.cookies.CookieConflictError
    :inherited-members:
+
+.. autoexception:: requests.cookies.CookieBranchConflictError
+   :members:
 
 
 

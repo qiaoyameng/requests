@@ -13,6 +13,7 @@ import calendar
 import copy
 import time
 from collections.abc import Iterator, MutableMapping
+from dataclasses import dataclass
 from http.cookiejar import Cookie, CookieJar, CookiePolicy
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
@@ -186,6 +187,34 @@ class CookieConflictError(RuntimeError):
     """There are two cookies that meet the criteria specified in the cookie jar.
     Use .get and .set and include domain and path args in order to be more specific.
     """
+
+
+@dataclass(frozen=True)
+class CookieBranchConflict:
+    """A cookie changed in both a branch and its parent session."""
+
+    domain: str
+    path: str
+    name: str
+    base_cookie: Cookie | None
+    current_cookie: Cookie | None
+    branch_cookie: Cookie | None
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return self.domain, self.path, self.name
+
+
+class CookieBranchConflictError(CookieConflictError):
+    """One or more cookies changed in a branch and its parent session."""
+
+    def __init__(self, conflicts: list[CookieBranchConflict]) -> None:
+        self.conflicts = conflicts
+        keys = ", ".join(
+            f"{conflict.name!r} for {conflict.domain}{conflict.path}"
+            for conflict in conflicts
+        )
+        super().__init__(f"Conflicting cookie changes: {keys}")
 
 
 class RequestsCookieJar(CookieJar, MutableMapping[str, str | None]):  # type: ignore[misc]
@@ -489,6 +518,103 @@ def _copy_cookie_jar(jar: CookieJar | None) -> CookieJar | None:  # type: ignore
     for cookie in jar:
         new_jar.set_cookie(copy.copy(cookie))
     return new_jar
+
+
+_CookieKey = tuple[str, str, str]
+_CookieState = tuple[Any, ...] | None
+_CookieSnapshotValue = tuple[Cookie | None, _CookieState]
+_CookieSnapshot = dict[_CookieKey, _CookieSnapshotValue]
+
+_COOKIE_STATE_ATTRS = (
+    "version",
+    "value",
+    "port",
+    "port_specified",
+    "domain_specified",
+    "domain_initial_dot",
+    "path_specified",
+    "secure",
+    "expires",
+    "discard",
+    "comment",
+    "comment_url",
+    "_rest",
+    "rfc2109",
+)
+
+
+def _cookie_key(cookie: Cookie) -> _CookieKey:
+    return cookie.domain, cookie.path, cookie.name
+
+
+def _cookie_state(cookie: Cookie | None) -> _CookieState | None:
+    if cookie is None:
+        return None
+    return tuple(getattr(cookie, attr) for attr in _COOKIE_STATE_ATTRS)
+
+
+def _cookie_snapshot(jar: CookieJar) -> _CookieSnapshot:
+    return {
+        _cookie_key(cookie): (cookie, _cookie_state(cookie))
+        for cookie in jar
+    }
+
+
+def _remove_expired_branch_cookies(
+    jar: CookieJar, baseline: _CookieSnapshot
+) -> None:
+    for key, (cookie, _state) in list(_cookie_snapshot(jar).items()):
+        if cookie is not None and key not in baseline and cookie.is_expired():
+            jar.clear(key[0], key[1], key[2])
+
+
+def commit_cookie_jar(
+    parent: CookieJar,
+    branch: CookieJar,
+    baseline: CookieJar,
+) -> None:
+    """Atomically apply branch cookie changes to a parent cookie jar."""
+    base = _cookie_snapshot(baseline)
+    _remove_expired_branch_cookies(branch, base)
+    current = _cookie_snapshot(parent)
+    updated = _cookie_snapshot(branch)
+
+    touched_keys = set(base) | set(current) | set(updated)
+    conflicts = []
+    for key in sorted(touched_keys):
+        base_cookie, base_state = base.get(key, (None, None))
+        current_cookie, current_state = current.get(key, (None, None))
+        branch_cookie, branch_state = updated.get(key, (None, None))
+
+        if base_state != branch_state and base_state != current_state:
+            conflicts.append(
+                CookieBranchConflict(
+                    domain=key[0],
+                    path=key[1],
+                    name=key[2],
+                    base_cookie=base_cookie,
+                    current_cookie=current_cookie,
+                    branch_cookie=branch_cookie,
+                )
+            )
+
+    if conflicts:
+        raise CookieBranchConflictError(conflicts)
+
+    for key in sorted(set(base) | set(updated)):
+        base_state = base.get(key, (None, None))[1]
+        branch_cookie, branch_state = updated.get(key, (None, None))
+        if base_state == branch_state:
+            continue
+
+        if key in current:
+            parent.clear(key[0], key[1], key[2])
+        if branch_cookie is not None:
+            parent.set_cookie(copy.copy(branch_cookie))
+
+    baseline.clear()
+    for cookie in parent:
+        baseline.set_cookie(copy.copy(cookie))
 
 
 def create_cookie(name: str, value: str, **kwargs: Any) -> Cookie:

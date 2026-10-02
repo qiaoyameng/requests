@@ -10,6 +10,7 @@ import re
 import tempfile
 import threading
 import warnings
+from email.message import Message
 from unittest import mock
 
 import pytest
@@ -29,7 +30,12 @@ from requests.compat import (
     is_urllib3_1,
     urlparse,
 )
-from requests.cookies import cookiejar_from_dict, morsel_to_cookie
+from requests.cookies import (
+    MockRequest,
+    MockResponse,
+    cookiejar_from_dict,
+    morsel_to_cookie,
+)
 from requests.exceptions import (
     ChunkedEncodingError,
     ConnectionError,
@@ -1439,6 +1445,214 @@ class TestRequests:
         jar = requests.cookies.RequestsCookieJar()
         jar.set_policy(MyCookiePolicy())
         assert isinstance(jar.copy().get_policy(), MyCookiePolicy)
+
+    def test_cookie_branch_interleaved_same_key_conflict_is_atomic(self):
+        parent = requests.Session()
+        parent.cookies.set("shared", "base", domain="example.com", path="/")
+        parent.cookies.set("parent", "base", domain="example.com", path="/")
+
+        first = parent.cookie_branch()
+        second = parent.cookie_branch()
+
+        first.cookies.set("shared", "first", domain="example.com", path="/")
+        first.cookies.set("first", "added", domain="example.com", path="/")
+        second.cookies.set("shared", "second", domain="example.com", path="/")
+        second.cookies.set("second", "added", domain="example.com", path="/")
+
+        first.commit()
+
+        with pytest.raises(requests.CookieBranchConflictError) as exc_info:
+            second.commit()
+
+        assert exc_info.value.conflicts[0].key == (
+            "example.com",
+            "/",
+            "shared",
+        )
+        assert parent.cookies.get("shared", domain="example.com") == "first"
+        assert parent.cookies.get("first", domain="example.com") == "added"
+        assert (
+            parent.cookies.get(
+                "second", domain="example.com", default="missing"
+            )
+            == "missing"
+        )
+        assert parent.cookies.get("parent", domain="example.com") == "base"
+
+        second.close()
+        assert parent.cookies.get("shared", domain="example.com") == "first"
+
+    def test_cookie_branch_keeps_same_name_different_paths(self):
+        parent = requests.Session()
+        parent.cookies.set("name", "base-root", domain="example.com", path="/")
+        parent.cookies.set("name", "base-api", domain="example.com", path="/api")
+
+        first = parent.cookie_branch()
+        second = parent.cookie_branch()
+
+        first.cookies.set("name", "first-root", domain="example.com", path="/")
+        second.cookies.set("name", "second-api", domain="example.com", path="/api")
+
+        first.commit()
+        second.commit()
+
+        assert (
+            parent.cookies.get(
+                "name", domain="example.com", path="/"
+            )
+            == "first-root"
+        )
+        assert parent.cookies.get(
+            "name", domain="example.com", path="/api"
+        ) == "second-api"
+
+    def test_cookie_branch_commit_deletes_expired_cookies(self):
+        parent = requests.Session()
+        parent.cookies.set("expired", "base", domain="example.com", path="/")
+
+        request = requests.PreparedRequest()
+        request.prepare(method="GET", url="http://example.com/")
+        headers = Message()
+        headers["Set-Cookie"] = (
+            "expired=deleted; expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/"
+        )
+
+        delete_branch = parent.cookie_branch()
+        other_branch = parent.cookie_branch()
+
+        delete_branch.cookies.extract_cookies(
+            MockResponse(headers), MockRequest(request)
+        )
+        other_branch.cookies.set(
+            "other", "value", domain="example.com", path="/"
+        )
+
+        assert list(delete_branch.cookies) == []
+        assert [cookie.name for cookie in other_branch.cookies] == [
+            "expired",
+            "other",
+        ]
+        assert parent.cookies.get(
+            "expired", domain="example.com", default="missing"
+        ) == "base"
+
+        delete_branch.commit()
+        other_branch.commit()
+        delete_branch.close()
+        other_branch.close()
+
+        assert parent.cookies.get(
+            "expired", domain="example.com", default="missing"
+        ) == "missing"
+        assert parent.cookies.get("other", domain="example.com") == "value"
+        assert [cookie.name for cookie in parent.cookies] == ["other"]
+
+    def test_cookie_branch_redirect_updates_branch_cookies_only(self):
+        parent = requests.Session()
+        adapter = mock.Mock()
+        parent.mount("http://", adapter)
+        request = parent.prepare_request(
+            requests.Request("GET", "http://example.com/start")
+        )
+
+        initial = requests.Response()
+        initial.url = "http://example.com/start"
+        initial.status_code = 302
+        initial.headers["location"] = "/next"
+        initial.request = request
+        initial_headers = Message()
+        initial_headers["Set-Cookie"] = "step=start; Path=/"
+        initial.raw = mock.Mock(
+            _original_response=mock.Mock(msg=initial_headers)
+        )
+        initial._content = b""
+        initial._content_consumed = True
+        initial.raw.read.return_value = b""
+        initial.raw.release_conn.return_value = None
+
+        redirect = requests.Response()
+        redirect.url = "http://example.com/next"
+        redirect.status_code = 200
+        redirect.request = request
+        redirect_headers = Message()
+        redirect_headers["Set-Cookie"] = "step=next; Path=/"
+        redirect.raw = mock.Mock(
+            _original_response=mock.Mock(msg=redirect_headers)
+        )
+        redirect._content = b""
+        redirect._content_consumed = True
+        redirect.raw.read.return_value = b""
+        redirect.raw.release_conn.return_value = None
+
+        with parent.cookie_branch() as branch:
+            adapter.send.side_effect = [initial, redirect]
+
+            response = branch.send(request, allow_redirects=True)
+
+            assert response is redirect
+            assert branch.adapters["http://"] is adapter
+            assert branch.cookies.get("step", domain="example.com") == "next"
+            assert parent.cookies.get("step", default="missing") == "missing"
+
+        assert parent.cookies.get("step", default="missing") == "missing"
+
+    def test_cookie_branch_normal_exit_does_not_commit_or_close_adapters(self):
+        parent = requests.Session()
+        adapter = mock.Mock(spec=HTTPAdapter)
+        parent.mount("https://", adapter)
+
+        with parent.cookie_branch() as branch:
+            assert branch.adapters["https://"] is adapter
+            assert branch.get_adapter("https://example.com") is adapter
+            assert branch.headers is parent.headers
+            assert branch.proxies is parent.proxies
+            assert branch.hooks is parent.hooks
+            assert branch.params is parent.params
+            branch.cookies.set("temporary", "value", domain="example.com")
+
+        assert branch.closed
+        adapter.close.assert_not_called()
+        assert parent.get_adapter("https://example.com") is adapter
+        assert parent.cookies.get("temporary", default="missing") == "missing"
+
+        with pytest.raises(RuntimeError):
+            branch.commit()
+
+    def test_cookie_branch_supports_generic_cookiejar_and_exception_exit(self):
+        parent = requests.Session()
+        parent.cookies = cookielib.CookieJar()
+        parent.cookies.set_cookie(
+            requests.cookies.create_cookie(
+                "existing", "base", domain="example.com", path="/"
+            )
+        )
+
+        with pytest.raises(RuntimeError):
+            with parent.cookie_branch() as branch:
+                branch.cookies.set_cookie(
+                    requests.cookies.create_cookie(
+                        "temporary", "value", domain="example.com", path="/"
+                    )
+                )
+                raise RuntimeError("abort branch")
+
+        assert branch.closed
+        assert [
+            (cookie.name, cookie.value) for cookie in parent.cookies
+        ] == [("existing", "base")]
+
+        with parent.cookie_branch() as branch:
+            branch.cookies.set_cookie(
+                requests.cookies.create_cookie(
+                    "new", "value", domain="example.com", path="/"
+                )
+            )
+            branch.commit()
+
+        assert {cookie.name for cookie in parent.cookies} == {
+            "existing",
+            "new",
+        }
 
     def test_time_elapsed_blank(self, httpbin):
         r = requests.get(httpbin("get"))
