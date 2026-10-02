@@ -431,6 +431,9 @@ Available hooks:
 ``response``:
     The response generated from a Request.
 
+``download``:
+    The response body finished downloading, or the download was
+    interrupted. Described in detail below.
 
 You can assign a hook function on a per-request basis by passing a
 ``{hook_name: callback_function}`` dictionary to the ``hooks`` request
@@ -482,6 +485,59 @@ be called on every request made to the session.  For example::
 
 A ``Session`` can have multiple hooks, which will be called in the order
 they are added.
+
+.. _download-hooks:
+
+Download Hooks
+--------------
+
+While the ``response`` hook fires as soon as response *headers* arrive, it
+cannot tell you whether the *body* was ever fully received. The ``download``
+hook fills that gap: it fires exactly once per response when the body
+download terminates, no matter how the body was consumed (automatic reading
+with ``stream=False``, manual iteration with ``stream=True``, or direct
+``content`` access)::
+
+    def on_download(event):
+        print(event.response.url, event.redirect_hop, event.outcome)
+
+    requests.get(url, hooks={'download': on_download})
+
+The callback receives a single ``DownloadEvent`` argument with these
+attributes:
+
+``response``:
+    The :class:`Response <requests.Response>` the event belongs to.
+
+``redirect_hop``:
+    Position of the response in its redirect chain: ``0`` for the original
+    request, ``1`` for the first redirect, and so on.
+
+``outcome``:
+    ``"eof"`` if the body was read to a normal end of stream, ``"error"``
+    if reading the body raised an exception, or ``"closed"`` if the
+    response was closed before the body was fully read. Only ``"eof"``
+    means the download completed; the ``completed`` property is a shortcut
+    for that check. A response that has only delivered its headers has not
+    fired any event yet, and a ``"closed"`` or ``"error"`` event must not
+    be counted as a completed download.
+
+``error``:
+    The exception that interrupted the download when ``outcome`` is
+    ``"error"``, otherwise ``None``.
+
+Unlike ``response`` hooks, the return value of a ``download`` hook is
+ignored: the hook runs after the body has already been delivered to your
+code, so it cannot replace it. If the hook itself calls
+:meth:`Response.close() <requests.Response.close>`, no recursive
+notification is triggered -- each response notifies at most once.
+
+Exceptions raised by a ``download`` hook are not swallowed: they propagate
+to whatever code triggered the event, i.e. the caller of
+:meth:`Response.iter_content() <requests.Response.iter_content>`,
+:attr:`Response.content <requests.Response.content>`, or
+:meth:`Response.close() <requests.Response.close>`. Handle your own
+exceptions inside the callback if that is not what you want.
 
 .. _custom-auth:
 

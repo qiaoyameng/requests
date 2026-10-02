@@ -4,7 +4,11 @@ Release History
 dev
 ---
 
-- \[Short description of non-trivial change.\]
+- Added a ``download`` event hook that fires exactly once per response when
+  the body download terminates, reporting the response, its redirect hop,
+  and the outcome (``"eof"``, ``"error"``, or ``"closed"``) via a
+  ``DownloadEvent`` payload. Session-level ``download`` hooks are now
+  preserved by hook merging even when no ``response`` hooks are registered.
 
 
 2.34.2 (2026-05-14)

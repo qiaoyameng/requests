@@ -66,7 +66,14 @@ from .exceptions import (
 )
 from .exceptions import JSONDecodeError as RequestsJSONDecodeError
 from .exceptions import SSLError as RequestsSSLError
-from .hooks import default_hooks
+from .hooks import (
+    DOWNLOAD_CLOSED,
+    DOWNLOAD_EOF,
+    DOWNLOAD_ERROR,
+    DownloadEvent,
+    default_hooks,
+    dispatch_download_hook,
+)
 from .status_codes import codes
 from .structures import CaseInsensitiveDict
 from .utils import (
@@ -403,6 +410,7 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
     body: _t.BodyType
     hooks: dict[str, list[_t.HookType]]
     _body_position: int | object | None
+    _redirect_hop: int
 
     def __init__(self) -> None:
         #: HTTP verb to send to the server.
@@ -420,6 +428,9 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         self.hooks = default_hooks()
         #: integer denoting starting position of a readable file-like body.
         self._body_position = None
+        #: position of this request in a redirect chain, set by
+        #: :meth:`Session.resolve_redirects` and stamped onto the response.
+        self._redirect_hop = 0
 
     def prepare(
         self,
@@ -737,6 +748,9 @@ class Response:
     _content: bytes | Literal[False] | None
     _content_consumed: bool
     _next: PreparedRequest | None
+    _redirect_hop: int
+    _download_notified: bool
+    hooks: dict[str, list[_t.HookType]]
     status_code: int
     headers: CaseInsensitiveDict[str]
     raw: Any
@@ -766,6 +780,9 @@ class Response:
         self._content = False
         self._content_consumed = False
         self._next = None
+        self._redirect_hop = 0
+        self._download_notified = False
+        self.hooks = default_hooks()
 
         #: Integer Code of responded HTTP Status, e.g. 404 or 200.
         self.status_code = None  # type: ignore[assignment]
@@ -829,6 +846,11 @@ class Response:
 
         # pickled objects do not have .raw
         setattr(self, "_content_consumed", True)
+        # the body was fully consumed before pickling, so the download
+        # event (if any) already fired on the original object.
+        setattr(self, "_download_notified", True)
+        setattr(self, "_redirect_hop", 0)
+        setattr(self, "hooks", default_hooks())
         setattr(self, "raw", None)
 
     def __repr__(self) -> str:
@@ -903,6 +925,28 @@ class Response:
             # to a standard Python utf-8 str.
             return "utf-8"
 
+    def _notify_download(
+        self, outcome: str, error: BaseException | None = None
+    ) -> None:
+        """Dispatches the ``download`` hook for this response, at most once.
+
+        The notification flag is set *before* the hooks run, so a hook that
+        calls :meth:`close` (or otherwise re-enters the download lifecycle)
+        cannot trigger a recursive notification. Hook return values are
+        ignored; hook exceptions propagate to the caller of whatever read
+        or close operation terminated the download.
+        """
+        if self._download_notified:
+            return
+        self._download_notified = True
+        event = DownloadEvent(
+            response=self,
+            redirect_hop=self._redirect_hop,
+            outcome=outcome,
+            error=error,
+        )
+        dispatch_download_hook(self.hooks, event)
+
     @overload
     def iter_content(
         self, chunk_size: int | None = 1, decode_unicode: Literal[False] = False
@@ -933,27 +977,35 @@ class Response:
         """
 
         def generate() -> Generator[bytes, None, None]:
-            # Special case for urllib3.
-            if hasattr(self.raw, "stream"):
-                try:
-                    yield from self.raw.stream(chunk_size, decode_content=True)
-                except ProtocolError as e:
-                    raise ChunkedEncodingError(e)
-                except DecodeError as e:
-                    raise ContentDecodingError(e)
-                except ReadTimeoutError as e:
-                    raise ConnectionError(e)
-                except SSLError as e:
-                    raise RequestsSSLError(e)
-            else:
-                # Standard file-like object.
-                while True:
-                    chunk = self.raw.read(chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
+            try:
+                # Special case for urllib3.
+                if hasattr(self.raw, "stream"):
+                    try:
+                        yield from self.raw.stream(chunk_size, decode_content=True)
+                    except ProtocolError as e:
+                        raise ChunkedEncodingError(e)
+                    except DecodeError as e:
+                        raise ContentDecodingError(e)
+                    except ReadTimeoutError as e:
+                        raise ConnectionError(e)
+                    except SSLError as e:
+                        raise RequestsSSLError(e)
+                else:
+                    # Standard file-like object.
+                    while True:
+                        chunk = self.raw.read(chunk_size)
+                        if not chunk:
+                            break
+                        yield chunk
+            except Exception as e:
+                # The download was interrupted by a read failure. Note that
+                # GeneratorExit is a BaseException and deliberately does not
+                # notify here; abandoning iteration is reported via close().
+                self._notify_download(DOWNLOAD_ERROR, e)
+                raise
 
             self._content_consumed = True
+            self._notify_download(DOWNLOAD_EOF)
 
         if self._content_consumed and isinstance(self._content, bool):
             raise StreamConsumedError()
@@ -1178,6 +1230,7 @@ class Response:
         """
         if not self._content_consumed:
             self.raw.close()
+            self._notify_download(DOWNLOAD_CLOSED)
 
         release_conn = getattr(self.raw, "release_conn", None)
         if release_conn is not None:

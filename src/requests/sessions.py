@@ -33,7 +33,7 @@ from .exceptions import (
     InvalidSchema,
     TooManyRedirects,
 )
-from .hooks import default_hooks, dispatch_hook
+from .hooks import HOOKS, default_hooks, dispatch_hook
 
 # formerly defined here, reexposed here for backward compatibility
 from .models import (  # noqa: F401
@@ -115,10 +115,10 @@ def merge_hooks(
     This is necessary because when request_hooks == {'response': []}, the
     merge breaks Session hooks entirely.
     """
-    if session_hooks is None or session_hooks.get("response") == []:
+    if session_hooks is None or not any(session_hooks.get(event) for event in HOOKS):
         return request_hooks
 
-    if request_hooks is None or request_hooks.get("response") == []:
+    if request_hooks is None or not any(request_hooks.get(event) for event in HOOKS):
         return session_hooks
 
     return merge_setting(request_hooks, session_hooks, dict_class)
@@ -203,6 +203,10 @@ class SessionRedirectMixin:
         previous_fragment = urlparse(req.url).fragment
         while url:
             prepared_request = req.copy()
+
+            # Carry the redirect hop onto the next request; the response
+            # created for it is stamped as soon as it arrives.
+            prepared_request._redirect_hop = resp._redirect_hop + 1
 
             # Update history and keep track of redirects.
             resp.history = hist[:]
@@ -783,12 +787,22 @@ class Session(SessionRedirectMixin):
         # Send the request
         r = adapter.send(request, **kwargs)
 
+        # Stamp the redirect hop carried by the request (if any) onto the
+        # response immediately, so download events report the correct hop
+        # even when the body is consumed before this method returns.
+        r._redirect_hop = getattr(request, "_redirect_hop", 0)
+
         # Total elapsed time of the request (approximately)
         elapsed = preferred_clock() - start
         r.elapsed = timedelta(seconds=elapsed)
 
         # Response manipulation hooks
         r = dispatch_hook("response", hooks, r, **kwargs)
+
+        # Expose the merged hooks on the response itself so that download
+        # events (body EOF, read error, or early close) can be dispatched
+        # against them whenever the body is eventually consumed.
+        r.hooks = hooks
 
         # Persist cookies
         if r.history:
