@@ -66,6 +66,15 @@ and Requests supports this out of the box as well::
     >>> requests.get(url, auth=HTTPDigestAuth('user', 'pass'))
     <Response [200]>
 
+When the same handler is used across hosts or protection spaces, pass
+``multi_domain=True``. In this mode Requests keeps nonces, counters, and stale
+state separately for each origin, realm, and challenge-declared domain. Digest
+credentials are only sent before a challenge when the request URL is inside a
+previously learned protection space::
+
+    >>> auth = HTTPDigestAuth('user', 'pass', multi_domain=True)
+    >>> requests.get('https://example.com/api', auth=auth)
+
 
 OAuth 1 Authentication
 ----------------------
