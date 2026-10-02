@@ -114,6 +114,8 @@ if TYPE_CHECKING:
         bytes | str | Iterable[bytes | str] | SupportsRead[bytes | str] | None
     )
 
+    BodyFactoryType: TypeAlias = Callable[[], BodyType]
+
     HeadersType: TypeAlias = Mapping[str, str | bytes] | None
 
     CookiesType: TypeAlias = RequestsCookieJar | Mapping[str, str]
@@ -155,6 +157,7 @@ if TYPE_CHECKING:
     # TypedDicts for Unpack kwargs (PEP 692)
 
     class BaseRequestKwargs(TypedDict, total=False):
+        body_factory: BodyFactoryType
         headers: HeadersType
         cookies: RequestsCookieJar | CookieJar | dict[str, str] | None
         files: FilesType

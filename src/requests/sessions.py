@@ -256,6 +256,7 @@ class SessionRedirectMixin:
                 for header in purged_headers:
                     prepared_request.headers.pop(header, None)
                 prepared_request.body = None
+                prepared_request.body_factory = None
 
             headers = prepared_request.headers
             headers.pop("Cookie", None)
@@ -543,6 +544,7 @@ class Session(SessionRedirectMixin):
             url=url,
             files=request.files,
             data=request.data,
+            body_factory=request.body_factory,
             json=request.json,
             headers=merge_setting(
                 request.headers, self.headers, dict_class=CaseInsensitiveDict
@@ -572,6 +574,7 @@ class Session(SessionRedirectMixin):
         verify: _t.VerifyType | None = None,
         cert: _t.CertType = None,
         json: _t.JsonType = None,
+        body_factory: _t.BodyFactoryType | None = None,
     ) -> Response:
         """Constructs a :class:`Request <Request>`, prepares it and sends it.
         Returns :class:`Response <Response>` object.
@@ -590,6 +593,8 @@ class Session(SessionRedirectMixin):
             :class:`Request`.
         :param files: (optional) Dictionary of ``'filename': file-like-objects``
             for multipart encoding upload.
+        :param body_factory: (optional) Zero-argument callable returning a
+            fresh request body for each transmission.
         :param auth: (optional) Auth tuple or callable to enable
             Basic/Digest/Custom HTTP Auth.
         :param timeout: (optional) How many seconds to wait for the server to send
@@ -626,6 +631,7 @@ class Session(SessionRedirectMixin):
             headers=headers,
             files=files,
             data=data or {},
+            body_factory=body_factory,
             json=json,
             params=params or {},
             auth=auth,

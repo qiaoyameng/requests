@@ -293,6 +293,9 @@ class Request(RequestHooksMixin):
     :param data: the body to attach to the request. If a dictionary or
         list of tuples ``[(key, value)]`` is provided, form-encoding will
         take place.
+    :param body_factory: zero-argument callable returning a fresh request body for
+        each transmission. Set ``content_length`` on the callable to declare
+        a fixed body length.
     :param json: json for the body to attach to the request (if files or data is not specified).
     :param params: URL parameters to append to the URL. If a dictionary or
         list of tuples ``[(key, value)]`` is provided, form-encoding will
@@ -315,6 +318,7 @@ class Request(RequestHooksMixin):
     headers: Mapping[str, str | bytes]
     files: _t.FilesType
     data: _t.DataType
+    body_factory: _t.BodyFactoryType | None
     json: _t.JsonType
     params: _t.ParamsType
     auth: _t.AuthType
@@ -332,6 +336,7 @@ class Request(RequestHooksMixin):
         cookies: RequestsCookieJar | CookieJar | dict[str, str] | None = None,
         hooks: _t.HooksInputType | None = None,
         json: _t.JsonType = None,
+        body_factory: _t.BodyFactoryType | None = None,
     ) -> None:
         # Default empty dicts for dict params.
         data = [] if data is None else data
@@ -349,6 +354,7 @@ class Request(RequestHooksMixin):
         self.headers = headers
         self.files = files
         self.data = data
+        self.body_factory = body_factory
         self.json = json
         self.params = params
         self.auth = auth
@@ -366,6 +372,7 @@ class Request(RequestHooksMixin):
             headers=self.headers,
             files=self.files,
             data=self.data,
+            body_factory=self.body_factory,
             json=self.json,
             params=self.params,
             auth=self.auth,
@@ -401,6 +408,7 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
     headers: CaseInsensitiveDict[str | bytes]
     _cookies: RequestsCookieJar | CookieJar | None
     body: _t.BodyType
+    body_factory: _t.BodyFactoryType | None
     hooks: dict[str, list[_t.HookType]]
     _body_position: int | object | None
 
@@ -416,6 +424,8 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         self._cookies = None
         #: request body to send to the server.
         self.body = None
+        #: factory used to create the request body for each transmission
+        self.body_factory = None
         #: dictionary of callback hooks, for internal usage.
         self.hooks = default_hooks()
         #: integer denoting starting position of a readable file-like body.
@@ -433,6 +443,7 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         cookies: RequestsCookieJar | CookieJar | dict[str, str] | None = None,
         hooks: _t.HooksInputType | None = None,
         json: _t.JsonType = None,
+        body_factory: _t.BodyFactoryType | None = None,
     ) -> None:
         """Prepares the entire request with the given parameters."""
 
@@ -441,7 +452,7 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         self.prepare_url(url, params)
         self.prepare_headers(headers)
         self.prepare_cookies(cookies)
-        self.prepare_body(data, files, json)
+        self.prepare_body(data, files, json, body_factory)
         self.prepare_auth(auth, url)
 
         # Note that prepare_auth must be last to enable authentication schemes
@@ -459,7 +470,8 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         p.url = self.url
         p.headers = self.headers.copy() if self.headers is not None else None  # type: ignore[assignment]
         p._cookies = _copy_cookie_jar(self._cookies)
-        p.body = self.body
+        p.body = None if self.body_factory is not None else self.body
+        p.body_factory = self.body_factory
         p.hooks = self.hooks
         p._body_position = self._body_position
         return p
@@ -574,7 +586,11 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
                 self.headers[to_native_string(name)] = value
 
     def prepare_body(
-        self, data: _t.DataType, files: _t.FilesType, json: _t.JsonType = None
+        self,
+        data: _t.DataType,
+        files: _t.FilesType,
+        json: _t.JsonType = None,
+        body_factory: _t.BodyFactoryType | None = None,
     ) -> None:
         """Prepares the given HTTP body data."""
 
@@ -582,8 +598,24 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         # If not, run through normal process.
 
         # Nottin' on you.
+        self.body_factory = body_factory
         body = None
         content_type = None
+
+        if body_factory is not None:
+            if files:
+                raise NotImplementedError(
+                    "Body factories and files are mutually exclusive."
+                )
+
+            self.body = None
+            factory_length = getattr(body_factory, "content_length", None)
+            if factory_length is not None:
+                self.headers["Content-Length"] = builtin_str(factory_length)
+                self.headers.pop("Transfer-Encoding", None)
+            elif "Content-Length" not in self.headers:
+                self.headers["Transfer-Encoding"] = "chunked"
+            return
 
         if not data and json is not None:
             # urllib3 requires a bytes-like body. Python 2's json.dumps
@@ -653,7 +685,11 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
 
     def prepare_content_length(self, body: _t.BodyType) -> None:
         """Prepare Content-Length header based on request method and body"""
-        if body is not None:
+        if self.body_factory is not None:
+            factory_length = getattr(self.body_factory, "content_length", None)
+            if factory_length is not None:
+                self.headers["Content-Length"] = builtin_str(factory_length)
+        elif body is not None:
             length = super_len(body)
             if length:
                 # If length exists, set it. Otherwise, we fallback
@@ -762,10 +798,15 @@ class Response:
         "request",
     ]
 
+    _request_body: Any
+    _request_body_closed: bool
+
     def __init__(self) -> None:
         self._content = False
         self._content_consumed = False
         self._next = None
+        self._request_body = None
+        self._request_body_closed = False
 
         #: Integer Code of responded HTTP Status, e.g. 404 or 200.
         self.status_code = None  # type: ignore[assignment]
@@ -830,6 +871,10 @@ class Response:
         # pickled objects do not have .raw
         setattr(self, "_content_consumed", True)
         setattr(self, "raw", None)
+        if not hasattr(self, "_request_body"):
+            setattr(self, "_request_body", None)
+        if not hasattr(self, "_request_body_closed"):
+            setattr(self, "_request_body_closed", False)
 
     def __repr__(self) -> str:
         return f"<Response [{self.status_code}]>"
@@ -1176,6 +1221,12 @@ class Response:
 
         *Note: Should not normally need to be called explicitly.*
         """
+        if not self._request_body_closed:
+            request_body_close = getattr(self._request_body, "close", None)
+            if request_body_close is not None:
+                request_body_close()
+            self._request_body_closed = True
+
         if not self._content_consumed:
             self.raw.close()
 

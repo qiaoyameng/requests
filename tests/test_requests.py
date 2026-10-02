@@ -2605,6 +2605,250 @@ class TestTimeout:
 SendCall = collections.namedtuple("SendCall", ("args", "kwargs"))
 
 
+class CountingBody:
+    def __init__(self, payload, factory):
+        self.payload = payload
+        self.factory = factory
+        self.position = 0
+        self.closed = False
+
+    def read(self, size=-1):
+        if self.position >= len(self.payload):
+            return b""
+        if size is None or size < 0:
+            size = len(self.payload) - self.position
+        chunk = self.payload[self.position : self.position + size]
+        self.position += len(chunk)
+        return chunk
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.factory.closed += 1
+
+    def __len__(self):
+        return len(self.payload)
+
+
+class CountingBodyFactory:
+    def __init__(self, payload=b"hello"):
+        self.payload = payload
+        self.created = 0
+        self.closed = 0
+        self.fail_next = False
+        self.content_length = len(payload)
+
+    def __call__(self):
+        self.created += 1
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("body creation failed")
+        return CountingBody(self.payload, self)
+
+
+class FakeBodyConnection:
+    def __init__(self, statuses, received_bodies, fail_body_read=False):
+        self.statuses = list(statuses)
+        self.received_bodies = received_bodies
+        self.fail_body_read = fail_body_read
+
+    def urlopen(self, method, url, body=None, headers=None, **kwargs):
+        if self.fail_body_read:
+            body.read()
+            raise OSError("send failed")
+
+        received = b""
+        if body is not None:
+            while True:
+                chunk = body.read(2)
+                if not chunk:
+                    break
+                received += chunk
+        if body is not None:
+            self.received_bodies.append(received)
+
+        status = self.statuses.pop(0)
+        raw = io.BytesIO(b"")
+        raw.status = status
+        raw.headers = CaseInsensitiveDict({"Location": "/next"})
+        raw.reason = "OK"
+        raw.release_conn = lambda: None
+        return raw
+
+
+def mount_fake_body_connection(session, connection):
+    adapter = HTTPAdapter()
+    adapter.get_connection_with_tls_context = (
+        lambda request, verify, proxies=None, cert=None: connection
+    )
+    session.mount("http://", adapter)
+    return adapter
+
+
+def test_body_factory_lifecycle_for_redirect_error_and_method_change():
+    body_factory = CountingBodyFactory()
+
+    redirect_session = requests.Session()
+    redirect_received = []
+    redirect_connection = FakeBodyConnection([307, 200], redirect_received)
+    mount_fake_body_connection(redirect_session, redirect_connection)
+    redirect_request = PreparedRequest()
+    redirect_request.prepare(
+        method="POST",
+        url="http://example.com/redirect",
+        body_factory=body_factory,
+    )
+    redirect_response = redirect_session.send(redirect_request)
+
+    assert redirect_response.status_code == 200
+    assert redirect_received == [b"hello", b"hello"]
+    assert body_factory.created == 2
+    assert body_factory.closed == 1
+    redirect_response.close()
+    assert body_factory.closed == 2
+
+    error_session = requests.Session()
+    error_received = []
+    error_connection = FakeBodyConnection(
+        [200], error_received, fail_body_read=True
+    )
+    mount_fake_body_connection(error_session, error_connection)
+    error_request = PreparedRequest()
+    error_request.prepare(
+        method="POST",
+        url="http://example.com/error",
+        body_factory=body_factory,
+    )
+    with pytest.raises(ConnectionError):
+        error_session.send(error_request)
+
+    assert error_request.body is None
+    assert body_factory.created == 3
+    assert body_factory.closed == 3
+
+    see_other_session = requests.Session()
+    see_other_received = []
+    see_other_connection = FakeBodyConnection([303, 200], see_other_received)
+    mount_fake_body_connection(see_other_session, see_other_connection)
+    see_other_request = PreparedRequest()
+    see_other_request.prepare(
+        method="POST",
+        url="http://example.com/see-other",
+        body_factory=body_factory,
+    )
+    see_other_response = see_other_session.send(see_other_request)
+
+    assert see_other_response.status_code == 200
+    assert see_other_response.request.method == "GET"
+    assert see_other_response.request.body is None
+    assert see_other_response.request.body_factory is None
+    assert see_other_received == [b"hello"]
+    assert body_factory.created == 4
+    assert body_factory.closed == 4
+    see_other_response.close()
+    assert body_factory.closed == 4
+
+
+def test_prepared_request_copy_retains_body_factory_without_calling_it():
+    body_factory = CountingBodyFactory()
+    request = PreparedRequest()
+    request.prepare(
+        method="POST",
+        url="http://example.com/",
+        body_factory=body_factory,
+    )
+
+    copied = request.copy()
+
+    assert body_factory.created == 0
+    assert copied.body is None
+    assert copied.body_factory is body_factory
+
+
+@pytest.mark.parametrize("status", (307, 308))
+def test_body_factory_is_recreated_for_redirects_that_retain_bodies(status):
+    body_factory = CountingBodyFactory()
+    session = requests.Session()
+    received = []
+    connection = FakeBodyConnection([status, 200], received)
+    mount_fake_body_connection(session, connection)
+    request = PreparedRequest()
+    request.prepare(
+        method="POST",
+        url="http://example.com/redirect",
+        body_factory=body_factory,
+    )
+
+    response = session.send(request)
+
+    assert received == [b"hello", b"hello"]
+    assert body_factory.created == 2
+    assert body_factory.closed == 1
+    response.close()
+    assert body_factory.closed == 2
+
+
+def test_body_factory_enforces_declared_content_length():
+    class MismatchedFactory(CountingBodyFactory):
+        def __call__(self):
+            body = super().__call__()
+            body.payload = b"abcd"
+            return body
+
+    body_factory = MismatchedFactory()
+    body_factory.content_length = 5
+    request = PreparedRequest()
+    request.prepare(
+        method="POST",
+        url="http://example.com/",
+        body_factory=body_factory,
+    )
+    adapter = HTTPAdapter()
+    connection = FakeBodyConnection([200], [])
+    adapter.get_connection_with_tls_context = (
+        lambda request, verify, proxies=None, cert=None: connection
+    )
+
+    with pytest.raises(ValueError, match="factory content length"):
+        adapter.send(request)
+
+    assert body_factory.created == 1
+    assert body_factory.closed == 1
+    assert request.body is None
+
+
+def test_body_factory_failure_after_previous_creation_closes_each_once():
+    body_factory = CountingBodyFactory()
+    first_request = PreparedRequest()
+    first_request.prepare(
+        method="POST",
+        url="http://example.com/first",
+        body_factory=body_factory,
+    )
+    received = []
+    connection = FakeBodyConnection([200], received)
+    adapter = HTTPAdapter()
+    adapter.get_connection_with_tls_context = (
+        lambda request, verify, proxies=None, cert=None: connection
+    )
+    first_response = adapter.send(first_request)
+    first_response.close()
+
+    body_factory.fail_next = True
+    next_request = PreparedRequest()
+    next_request.prepare(
+        method="POST",
+        url="http://example.com/next",
+        body_factory=body_factory,
+    )
+
+    with pytest.raises(RuntimeError):
+        adapter.send(next_request)
+
+    assert body_factory.created == 2
+    assert body_factory.closed == 1
+
+
 class RedirectSession(SessionRedirectMixin):
     def __init__(self, order_of_redirects):
         self.redirects = order_of_redirects

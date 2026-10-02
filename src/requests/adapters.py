@@ -56,6 +56,7 @@ from .utils import (
     get_encoding_from_headers,
     prepend_scheme_if_needed,
     select_proxy,
+    super_len,
     urldefragauth,
 )
 
@@ -80,6 +81,12 @@ DEFAULT_POOLBLOCK = False
 DEFAULT_POOLSIZE = 10
 DEFAULT_RETRIES = 0
 DEFAULT_POOL_TIMEOUT = None
+
+
+def _close_request_body(body: Any) -> None:
+    close = getattr(body, "close", None)
+    if close is not None:
+        close()
 
 
 def _urllib3_request_context(
@@ -676,8 +683,6 @@ class HTTPAdapter(BaseAdapter):
             proxies=proxies,
         )
 
-        chunked = not (request.body is None or "Content-Length" in request.headers)
-
         if isinstance(timeout, tuple):
             try:
                 connect, read = timeout
@@ -692,7 +697,38 @@ class HTTPAdapter(BaseAdapter):
         else:
             resolved_timeout = TimeoutSauce(connect=timeout, read=timeout)
 
+        body_owned = False
         try:
+            request_body = None
+            if request.body_factory is not None:
+                request_body = request.body_factory()
+                body_owned = True
+                request.body = request_body
+
+                declared_length = request.headers.get("Content-Length")
+                actual_length = super_len(request_body)
+                factory_length = getattr(
+                    request.body_factory, "content_length", None
+                )
+                if factory_length is not None:
+                    if declared_length != str(factory_length):
+                        raise ValueError(
+                            "Request body factory changed its content length."
+                        )
+                    if actual_length and actual_length != int(factory_length):
+                        raise ValueError(
+                            "Request body does not match the factory content length."
+                        )
+                elif declared_length is not None and actual_length:
+                    if str(actual_length) != str(declared_length):
+                        raise ValueError(
+                            "Request body does not match Content-Length."
+                        )
+
+            chunked = not (
+                request.body is None or "Content-Length" in request.headers
+            )
+
             resp = conn.urlopen(
                 method=request.method,
                 url=url,
@@ -706,6 +742,11 @@ class HTTPAdapter(BaseAdapter):
                 timeout=resolved_timeout,
                 chunked=chunked,
             )
+
+            response = self.build_response(request, resp)
+            response._request_body = request_body
+            body_owned = False
+            return response
 
         except (ProtocolError, OSError) as err:
             raise ConnectionError(err, request=request)
@@ -745,4 +786,7 @@ class HTTPAdapter(BaseAdapter):
             else:
                 raise
 
-        return self.build_response(request, resp)
+        finally:
+            if body_owned:
+                _close_request_body(request_body)
+                request.body = None
