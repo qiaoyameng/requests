@@ -4,6 +4,12 @@ Release History
 dev
 ---
 
+- `HTTPDigestAuth` now supports `qop=auth-int` challenges: the digest of the
+  exact request entity bytes is included in the authentication response.
+  `bytes` bodies and seekable binary streams are supported (the stream
+  position is restored after hashing); non-replayable bodies such as
+  generators are rejected with a `ValueError`. Stale challenges are now
+  retried once with the fresh nonce provided by the server.
 - \[Short description of non-trivial change.\]
 
 

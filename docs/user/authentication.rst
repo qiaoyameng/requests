@@ -66,6 +66,13 @@ and Requests supports this out of the box as well::
     >>> requests.get(url, auth=HTTPDigestAuth('user', 'pass'))
     <Response [200]>
 
+Both the ``auth`` and ``auth-int`` quality-of-protection modes are supported.
+With ``auth-int``, the digest of the exact request entity bytes is included
+in the authentication response, so the body must be replayable: ``bytes``
+and seekable binary streams (whose position is restored after hashing) work,
+while non-replayable bodies such as generators are rejected with a
+``ValueError``.
+
 
 OAuth 1 Authentication
 ----------------------

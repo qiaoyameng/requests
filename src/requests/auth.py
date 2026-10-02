@@ -14,7 +14,7 @@ import threading
 import time
 import warnings
 from base64 import b64encode
-from typing import TYPE_CHECKING, Any, Final, cast, overload
+from typing import TYPE_CHECKING, Any, Callable, Final, cast, overload
 
 from ._internal_utils import to_native_string
 from .compat import basestring, str, urlparse
@@ -29,6 +29,58 @@ if TYPE_CHECKING:
 
 CONTENT_TYPE_FORM_URLENCODED: Final = "application/x-www-form-urlencoded"
 CONTENT_TYPE_MULTI_PART: Final = "multipart/form-data"
+
+
+def _get_entity_body_digest(body: Any, hash_constructor: Callable[..., Any]) -> str:
+    """Return the hex digest of the exact bytes of a request entity body.
+
+    The digest covers the entity as it will be sent on the wire: transfer
+    encoding boundaries (e.g. chunks) are never mixed in, and text is
+    encoded to UTF-8 exactly once. Seekable streams are hashed from their
+    current position, which is restored afterwards so the body can still
+    be transmitted. Bodies that cannot be replayed (e.g. generators or
+    non-seekable streams) are rejected outright instead of being silently
+    treated as empty.
+    """
+    if body is None:
+        return hash_constructor(b"", usedforsecurity=False).hexdigest()
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    if isinstance(body, (bytes, bytearray, memoryview)):
+        return hash_constructor(body, usedforsecurity=False).hexdigest()
+
+    read = getattr(body, "read", None)
+    tell = getattr(body, "tell", None)
+    seek = getattr(body, "seek", None)
+    if read is None or tell is None or seek is None:
+        raise ValueError(
+            "Cannot compute the entity digest required by qop=auth-int: "
+            "the request body is not replayable. Digest authentication "
+            "with qop=auth-int requires a body of bytes or a seekable "
+            "binary stream."
+        )
+    try:
+        pos = tell()
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "Cannot compute the entity digest required by qop=auth-int: "
+            "the position of the request body stream cannot be determined."
+        ) from exc
+
+    digest = hash_constructor(usedforsecurity=False)
+    try:
+        while True:
+            chunk = read(65536)
+            if not chunk:
+                break
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+            digest.update(chunk)
+    finally:
+        # Restore the original position so the body can still be sent.
+        seek(pos)
+
+    return digest.hexdigest()
 
 
 def _basic_auth_str(username: bytes | str, password: bytes | str) -> str:
@@ -154,7 +206,9 @@ class HTTPDigestAuth(AuthBase):
             self._thread_local.pos = None
             self._thread_local.num_401_calls = None
 
-    def build_digest_header(self, method: str, url: str) -> str | None:
+    def build_digest_header(
+        self, method: str, url: str, body: Any = None
+    ) -> str | None:
         """
         :rtype: str
         """
@@ -164,54 +218,32 @@ class HTTPDigestAuth(AuthBase):
         qop = self._thread_local.chal.get("qop")
         algorithm = self._thread_local.chal.get("algorithm")
         opaque = self._thread_local.chal.get("opaque")
-        hash_utf8 = None
 
         if algorithm is None:
             _algorithm = "MD5"
         else:
             _algorithm = algorithm.upper()
-        # lambdas assume digest modules are imported at the top level
+        # constructors assume digest modules are imported at the top level
         if _algorithm == "MD5" or _algorithm == "MD5-SESS":
-
-            def md5_utf8(x: str | bytes) -> str:
-                if isinstance(x, str):
-                    x = x.encode("utf-8")
-                return hashlib.md5(x, usedforsecurity=False).hexdigest()
-
-            hash_utf8 = md5_utf8
+            hash_constructor = hashlib.md5
         elif _algorithm == "SHA":
-
-            def sha_utf8(x: str | bytes) -> str:
-                if isinstance(x, str):
-                    x = x.encode("utf-8")
-                return hashlib.sha1(x, usedforsecurity=False).hexdigest()
-
-            hash_utf8 = sha_utf8
+            hash_constructor = hashlib.sha1
         elif _algorithm == "SHA-256":
-
-            def sha256_utf8(x: str | bytes) -> str:
-                if isinstance(x, str):
-                    x = x.encode("utf-8")
-                return hashlib.sha256(x, usedforsecurity=False).hexdigest()
-
-            hash_utf8 = sha256_utf8
+            hash_constructor = hashlib.sha256
         elif _algorithm == "SHA-512":
-
-            def sha512_utf8(x: str | bytes) -> str:
-                if isinstance(x, str):
-                    x = x.encode("utf-8")
-                return hashlib.sha512(x, usedforsecurity=False).hexdigest()
-
-            hash_utf8 = sha512_utf8
-
-        if hash_utf8 is None:
+            hash_constructor = hashlib.sha512
+        else:
+            # Unsupported algorithm: cannot build a digest header.
             return None
+
+        def hash_utf8(x: str | bytes) -> str:
+            if isinstance(x, str):
+                x = x.encode("utf-8")
+            return hash_constructor(x, usedforsecurity=False).hexdigest()
 
         def KD(s: str, d: str) -> str:
             return hash_utf8(f"{s}:{d}")
 
-        # XXX not implemented yet
-        entdig = None
         p_parsed = urlparse(url)
         #: path is request-uri defined in RFC 2616 which should not be empty
         path = p_parsed.path or "/"
@@ -222,7 +254,6 @@ class HTTPDigestAuth(AuthBase):
         A2 = f"{method}:{path}"
 
         HA1 = hash_utf8(A1)
-        HA2 = hash_utf8(A2)
 
         if nonce == self._thread_local.last_nonce:
             self._thread_local.nonce_count += 1
@@ -238,14 +269,33 @@ class HTTPDigestAuth(AuthBase):
         if _algorithm == "MD5-SESS":
             HA1 = hash_utf8(f"{HA1}:{nonce}:{cnonce}")  # type: ignore[reportConstantRedefinition]  # RFC 2617 terminology
 
-        if not qop:
-            respdig = KD(HA1, f"{nonce}:{HA2}")
-        elif qop == "auth" or "auth" in qop.split(","):
-            noncebit = f"{nonce}:{ncvalue}:{cnonce}:auth:{HA2}"
-            respdig = KD(HA1, noncebit)
-        else:
-            # XXX handle auth-int.
+        qop_options = [option.strip() for option in qop.split(",")] if qop else []
+        qop_used: str | None
+        if "auth" in qop_options:
+            # Prefer "auth" when the server offers a choice: it does not
+            # require hashing the request entity.
+            qop_used = "auth"
+        elif "auth-int" in qop_options:
+            qop_used = "auth-int"
+        elif qop_options:
+            # The server only offered qop options we don't support.
             return None
+        else:
+            qop_used = None
+
+        if qop_used == "auth-int":
+            # RFC 7616: for auth-int, A2 additionally contains the hash of
+            # the exact bytes of the request entity.
+            entdig = _get_entity_body_digest(body, hash_constructor)
+            A2 = f"{A2}:{entdig}"
+
+        HA2 = hash_utf8(A2)
+
+        if qop_used is None:
+            respdig = KD(HA1, f"{nonce}:{HA2}")
+        else:
+            noncebit = f"{nonce}:{ncvalue}:{cnonce}:{qop_used}:{HA2}"
+            respdig = KD(HA1, noncebit)
 
         self._thread_local.last_nonce = nonce
 
@@ -258,10 +308,8 @@ class HTTPDigestAuth(AuthBase):
             base += f', opaque="{opaque}"'
         if algorithm:
             base += f', algorithm="{algorithm}"'
-        if entdig:
-            base += f', digest="{entdig}"'
-        if qop:
-            base += f', qop="auth", nc={ncvalue}, cnonce="{cnonce}"'
+        if qop_used:
+            base += f', qop="{qop_used}", nc={ncvalue}, cnonce="{cnonce}"'
 
         return f"Digest {base}"
 
@@ -283,17 +331,35 @@ class HTTPDigestAuth(AuthBase):
             self._thread_local.num_401_calls = 1
             return r
 
-        if self._thread_local.pos is not None:
-            # Rewind the file position indicator of the body to where
-            # it was to resend the request.
-            if (seek := getattr(r.request.body, "seek", None)) is not None:
-                seek(self._thread_local.pos)
-        s_auth = r.headers.get("www-authenticate", "")
+        # A single request may be challenged more than once (e.g. when the
+        # server replies with a stale nonce), so keep answering challenges
+        # until the server accepts the response or stops challenging us.
+        while True:
+            if self._thread_local.pos is not None:
+                # Rewind the file position indicator of the body to where
+                # it was to resend the request.
+                if (seek := getattr(r.request.body, "seek", None)) is not None:
+                    seek(self._thread_local.pos)
+            s_auth = r.headers.get("www-authenticate", "")
 
-        if "digest" in s_auth.lower() and self._thread_local.num_401_calls < 2:
-            self._thread_local.num_401_calls += 1
+            if "digest" not in s_auth.lower():
+                self._thread_local.num_401_calls = 1
+                return r
+
             pat = re.compile(r"digest ", flags=re.IGNORECASE)
-            self._thread_local.chal = parse_dict_header(pat.sub("", s_auth, count=1))
+            chal = parse_dict_header(pat.sub("", s_auth, count=1))
+
+            # A stale challenge means the server rejected the nonce (e.g. it
+            # expired) but not necessarily the credentials, so allow one
+            # extra attempt to retry with the fresh nonce it provided.
+            stale = (chal.get("stale") or "").lower() == "true"
+            max_401_calls = 3 if stale else 2
+            if self._thread_local.num_401_calls >= max_401_calls:
+                self._thread_local.num_401_calls = 1
+                return r
+
+            self._thread_local.num_401_calls += 1
+            self._thread_local.chal = chal
 
             # Consume content and release the original connection
             # to allow our new request to reuse the same one.
@@ -305,18 +371,19 @@ class HTTPDigestAuth(AuthBase):
             prep.prepare_cookies(cookie_jar)
 
             _digest_auth = self.build_digest_header(
-                cast(str, prep.method), cast(str, prep.url)
+                cast(str, prep.method), cast(str, prep.url), prep.body
             )
             if _digest_auth:
                 prep.headers["Authorization"] = _digest_auth
             _r = r.connection.send(prep, **kwargs)
+            _r.history.extend(r.history)
             _r.history.append(r)
             _r.request = prep
 
-            return _r
-
-        self._thread_local.num_401_calls = 1
-        return r
+            r = _r
+            if not 400 <= r.status_code < 500:
+                self._thread_local.num_401_calls = 1
+                return r
 
     def __call__(self, r: PreparedRequest) -> PreparedRequest:
         # Initialize per-thread state, if needed
@@ -324,7 +391,7 @@ class HTTPDigestAuth(AuthBase):
         # If we have a saved nonce, skip the 401
         if self._thread_local.last_nonce:
             _digest_auth = self.build_digest_header(
-                cast(str, r.method), cast(str, r.url)
+                cast(str, r.method), cast(str, r.url), r.body
             )
             if _digest_auth:
                 r.headers["Authorization"] = _digest_auth
